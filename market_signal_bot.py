@@ -1,0 +1,2020 @@
+"""
+Market Signal Bot — MAX Edition
+Runs once per invocation via GitHub Actions (every 5 min).
+Keys are read from environment variables — set them as GitHub Secrets.
+
+Upgrades:
+  1.  Live intraday prices (today's open vs now, signed move)
+  2.  AI sentiment/impact score (1-10) factored into signal strength
+  3.  AI entry, stop loss, and target price levels
+  4.  Economic calendar — high-impact events injected into AI context
+  5.  Duplicate story filter — similar headlines from different sources skipped
+  6.  Weekly summary — Monday recap of all signals from the past week
+  7.  MACD indicator — momentum confirmation alongside RSI
+  8.  Volume spike detection — 2x average volume = confirmed move
+  9.  Multi-source confirmation — 3+ outlets reporting = score boost
+  10. Support & Resistance — auto-detected from recent price data
+  11. Crypto Fear & Greed Index — from alternative.me (free, no key)
+  12. Daily trend context — big-picture RSI + EMA from daily bars
+  13. DXY (Dollar Index) — shown as context for macro/forex signals
+  14. Signal confidence rating — X/5 indicators aligned
+  15. Streak tracking — consecutive BUY/SELL signals per symbol
+"""
+
+import re
+import feedparser
+import requests
+import anthropic
+import os
+import time
+import json
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from difflib import SequenceMatcher
+
+# ─────────────────────────────
+# CONFIG
+# ─────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.environ.get("CHAT_ID", "")
+ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY", "")
+
+SCORE_THRESHOLD      = 55
+MAX_HEADLINE_AGE_MIN = 45
+SYMBOL_COOLDOWN_MIN  = 15
+SIMILARITY_THRESHOLD = 0.78
+SEEN_FILE            = "seen_headlines.json"
+MAX_SIGNALS_PER_RUN  = 5   # Cap signals per 5-min run — prevents Telegram spam during news floods
+
+if not all([TELEGRAM_TOKEN, CHAT_ID, ANTHROPIC_KEY]):
+    raise SystemExit("ERROR: TELEGRAM_TOKEN, CHAT_ID, and ANTHROPIC_KEY must be set.")
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# ─────────────────────────────
+# FEEDS
+# ─────────────────────────────
+NEWS_FEEDS = [
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://feeds.reuters.com/reuters/UKBusinessNews",
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+    "https://feeds.finance.yahoo.com/rss/2.0/headline",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.investing.com/rss/news_25.rss",   # Forex
+    "https://www.investing.com/rss/news_8.rss",    # Stock markets
+    "https://www.investing.com/rss/news_14.rss",   # Commodities
+    "https://www.fxstreet.com/rss/news",
+    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
+    "https://www.aljazeera.com/xml/rss/all.xml",   # Live geopolitical/war updates
+    "https://www.forexlive.com/feed/news",          # Best real-time macro/forex feed
+    "https://www.kitco.com/rss/kitco-news.xml",     # Gold & precious metals focus
+    "https://oilprice.com/rss/main",                # Oil & energy focus
+]
+
+ANALYSIS_FEEDS = [
+    "https://www.fxstreet.com/rss/analysis",
+    "https://www.dailyfx.com/feeds/all",            # Professional forex analysis (IG Group)
+]
+
+CRYPTO_FEEDS = [
+    "https://www.coindesk.com/arc/outbound/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://www.investing.com/rss/news_301.rss",
+    "https://www.theblock.co/rss.xml",              # Institutional crypto journalism
+    "https://blockworks.co/feed",                   # Macro x crypto intersection
+]
+
+ALL_FEEDS = (
+    [(url, "📰 NEWS") for url in NEWS_FEEDS] +
+    [(url, "📊 ANALYSIS") for url in ANALYSIS_FEEDS] +
+    [(url, "🪙 CRYPTO") for url in CRYPTO_FEEDS]
+)
+
+WEEKEND_FEEDS = [(url, "🪙 CRYPTO") for url in CRYPTO_FEEDS]
+
+# ─────────────────────────────
+# ASSET MAP & FRIENDLY NAMES
+# ─────────────────────────────
+ASSET_MAP = {
+    "GC=F":     ["gold", "xau", "bullion", "precious metal"],
+    "ALI=F":    ["aluminium", "aluminum", "alcoa", "bauxite", "rusal", "aluminium smelter",
+                 "aluminum smelter", "norsk hydro", "hindalco", "aluminium tariff",
+                 "aluminum tariff", "aluminium supply", "aluminum supply"],
+    "CL=F":     ["oil", "crude", "wti", "brent", "opec", "petroleum", "energy"],
+    "^GSPC":    ["s&p", "spx", "spy", "sp500", "s&p 500", "equities", "wall street"],
+    "QQQ":      ["nasdaq", "qqq", "nq", "us100", "tech 100"],
+    "GBPUSD=X": ["gbp", "pound", "sterling", "bank of england"],
+    "EURUSD=X": ["eur", "euro", "ecb", "eurozone", "european central bank"],
+    "BTC-USD":  ["bitcoin", "btc", "crypto", "cryptocurrency", "digital asset", "satoshi", "halving",
+                 "stablecoin", "stablecoins", "usdt", "usdc", "tether",
+                 "blockchain", "tge", "token generation", "web3", "altcoin", "coinbase", "binance"],
+    "ETH-USD":  ["ethereum", "defi", "smart contract", "layer 2", "l2", "eip"],
+}
+
+ASSET_NAMES = {
+    "GC=F":     "Gold (XAU/USD)",
+    "ALI=F":    "Aluminium (ALI/USD)",
+    "CL=F":     "Crude Oil (WTI)",
+    "^GSPC":    "S&P 500",
+    "QQQ":      "US Tech 100 (Nasdaq)",
+    "GBPUSD=X": "GBP/USD (Pound)",
+    "EURUSD=X": "EUR/USD (Euro)",
+    "BTC-USD":  "Bitcoin (BTC/USD)",
+    "ETH-USD":  "Ethereum (ETH/USD)",
+}
+
+# Context-only symbols — fetched for data, never trigger signals
+CONTEXT_SYMBOLS = {
+    "DX-Y.NYB": "US Dollar Index (DXY)",
+    "^VIX":     "CBOE Volatility Index (VIX)",
+}
+
+# Crypto symbols — trade 24/7 including weekends
+CRYPTO_SYMBOLS = {"BTC-USD", "ETH-USD"}
+
+# Forex pairs are exchange rates — displayed without $ prefix
+FOREX_SYMBOLS = {"GBPUSD=X", "EURUSD=X"}
+
+def friendly(symbol: str) -> str:
+    return ASSET_NAMES.get(symbol, CONTEXT_SYMBOLS.get(symbol, symbol))
+
+# ─────────────────────────────
+# KEYWORDS
+# ─────────────────────────────
+KEYWORDS = [
+    "cpi", "inflation", "fed", "fomc", "interest rate",
+    "rate hike", "rate cut", "nfp", "jobs report",
+    "gdp", "recession", "powell", "treasury", "yield", "dollar", "dxy",
+    "gold", "xau", "bullion", "precious metal",
+    "aluminium", "aluminum", "alcoa", "bauxite", "rusal", "norsk hydro", "hindalco",
+    "oil", "crude", "wti", "brent", "opec", "petroleum", "energy",
+    "s&p", "spx", "spy", "sp500", "s&p 500", "wall street", "equities",
+    "nasdaq", "qqq", "nq", "us100", "tech 100",
+    "gbp", "pound", "sterling", "bank of england",
+    "eur", "euro", "ecb", "european central bank", "eurozone",
+    "bitcoin", "btc", "ethereum", "crypto", "cryptocurrency",
+    "digital asset", "blockchain", "defi", "halving", "altcoin", "stablecoin",
+    "sec crypto", "etf crypto", "bitcoin etf", "coinbase", "binance",
+    "smart contract", "layer 2", "l2", "on-chain",
+    # Note: "eth" and "ether" intentionally excluded — substrings of "netherlands",
+    # "together", "whether" etc. "ethereum" is specific enough.
+]
+
+CRYPTO_KEYWORDS = [
+    "bitcoin", "btc", "ethereum", "crypto", "cryptocurrency",
+    "digital asset", "blockchain", "defi", "halving", "altcoin", "stablecoin",
+    "stablecoins", "usdt", "usdc", "tether", "coinbase", "binance",
+    "bitcoin etf", "sec crypto",
+]
+# Note: "eth" intentionally excluded — it is a substring of "netherlands",
+# "method", "elizabeth" etc. ASSET_MAP still routes ETH headlines correctly.
+# Crypto scoring is handled via signal_type "🪙 CRYPTO" from crypto feeds.
+
+MACRO_KEYWORDS = [
+    "fed", "fomc", "powell", "interest rate", "rate hike", "rate cut",
+    "cpi", "inflation", "nfp", "jobs report", "gdp", "recession",
+    "treasury", "yield", "dollar", "dxy",
+]
+
+def is_important(text: str) -> bool:
+    return any(k in text.lower() for k in KEYWORDS)
+
+def is_macro(text: str) -> bool:
+    return any(k in text.lower() for k in MACRO_KEYWORDS)
+
+def is_crypto_headline(text: str) -> bool:
+    return any(k in text.lower() for k in CRYPTO_KEYWORDS)
+
+# ─────────────────────────────
+# NEWS SENTIMENT SCORING
+# Pre-screens headlines before we burn AI tokens on them. Headlines with no
+# directional language (or perfectly balanced) get the same baseline score
+# they always did; headlines with strong bullish/bearish language get a
+# small score nudge so genuinely directional news rises faster.
+# ─────────────────────────────
+BULLISH_KEYWORDS = [
+    "rally", "surge", "soar", "jump", "spike", "climb", "rise", "gain",
+    "boost", "beat", "beats", "exceed", "exceeds", "outperform", "upgrade",
+    "bullish", "breakout", "record high", "all-time high", "ath", "strong",
+    "robust", "solid", "approve", "approved", "accelerate", "expand",
+    "growth", "profit", "earnings beat", "buy rating", "long",
+    "rate cut", "stimulus", "easing", "dovish", "soft inflation",
+    "recovery", "rebound", "upbeat", "optimism", "positive",
+]
+
+BEARISH_KEYWORDS = [
+    "plunge", "crash", "tumble", "slump", "drop", "fall", "decline", "sink",
+    "miss", "misses", "underperform", "downgrade", "bearish", "breakdown",
+    "record low", "all-time low", "weak", "fragile", "reject", "rejected",
+    "decelerate", "contract", "loss", "losses", "earnings miss", "sell rating",
+    "short", "rate hike", "tightening", "hawkish", "hot inflation",
+    "recession", "slowdown", "downturn", "pessimism", "negative",
+    "war", "sanctions", "default", "bankruptcy", "fraud", "investigation",
+    "ban", "banned", "halt", "halts", "concerns", "fears", "panic",
+]
+
+def score_headline_sentiment(title: str) -> tuple:
+    """Return (sentiment_score, label) where score ranges -100..+100.
+
+    >  20: bullish-leaning headline
+    < -20: bearish-leaning headline
+    else: neutral / mixed
+    """
+    t           = title.lower()
+    bull_hits   = sum(1 for k in BULLISH_KEYWORDS if k in t)
+    bear_hits   = sum(1 for k in BEARISH_KEYWORDS if k in t)
+    total_hits  = bull_hits + bear_hits
+    if total_hits == 0:
+        return 0, "neutral"
+    raw = (bull_hits - bear_hits) / total_hits * 100
+    raw = round(raw)
+    if raw >= 30:
+        return raw, "bullish"
+    if raw <= -30:
+        return raw, "bearish"
+    return raw, "mixed"
+
+def is_weekend() -> bool:
+    """True on Sat/Sun and Fri after 22:00 UTC.
+
+    Friday after 22:00 UTC is when forex closes for the week, so all
+    traditional markets are shut — only crypto trades. Treating this
+    window as 'weekend' makes the bot stay alive on crypto-only mode
+    instead of returning early via is_market_open and missing 2 hours
+    of crypto signals every week.
+    """
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:                          # Saturday, Sunday
+        return True
+    if now.weekday() == 4 and now.hour >= 22:       # Friday after forex close
+        return True
+    return False
+
+# ─────────────────────────────
+# TIME HELPERS
+# ─────────────────────────────
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def is_market_open() -> bool:
+    now  = now_utc()
+    day  = now.weekday()
+    hour = now.hour
+    if day == 5:
+        return False
+    if day == 6:
+        return hour >= 22
+    if day == 4 and hour >= 22:
+        return False
+    return True
+
+def get_session_label() -> str:
+    hour = now_utc().hour
+    day  = now_utc().weekday()
+    if day >= 5:
+        return "Weekend"
+    if hour >= 22 or hour < 7:
+        return "Asia Session"
+    if 7 <= hour < 13:
+        return "London Session"
+    if 13 <= hour < 17:
+        return "London/NY Overlap"
+    if 17 <= hour < 22:
+        return "NY Session"
+    return "Off Hours"
+
+# ─────────────────────────────
+# TECHNICAL INDICATORS
+# ─────────────────────────────
+def calculate_rsi(closes: list, period: int = 14):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(closes) - 1):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+def calculate_ema(closes: list, period: int):
+    if len(closes) < period:
+        return None
+    k   = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 4)
+
+def calculate_macd(closes: list, fast: int = 12, slow: int = 26, signal_period: int = 9):
+    """Returns (macd_line, signal_line, histogram) or (None, None, None)."""
+    if len(closes) < slow + signal_period:
+        return None, None, None
+    k_fast = 2 / (fast + 1)
+    k_slow = 2 / (slow + 1)
+    k_sig  = 2 / (signal_period + 1)
+
+    ef = sum(closes[:fast]) / fast
+    es = sum(closes[:slow]) / slow
+    for i in range(fast, slow):
+        ef = closes[i] * k_fast + ef * (1 - k_fast)
+
+    macd_series = []
+    for i in range(slow, len(closes)):
+        ef = closes[i] * k_fast + ef * (1 - k_fast)
+        es = closes[i] * k_slow + es * (1 - k_slow)
+        macd_series.append(ef - es)
+
+    if len(macd_series) < signal_period:
+        return None, None, None
+
+    sig = sum(macd_series[:signal_period]) / signal_period
+    for m in macd_series[signal_period:]:
+        sig = m * k_sig + sig * (1 - k_sig)
+
+    return round(macd_series[-1], 6), round(sig, 6), round(macd_series[-1] - sig, 6)
+
+def calculate_atr(highs: list, lows: list, closes: list, period: int = 14):
+    """Wilder's Average True Range — measures actual volatility."""
+    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return round(atr, 6)
+
+def rsi_label(rsi) -> str:
+    if rsi is None:
+        return "n/a"
+    if rsi >= 70:
+        return f"{rsi} (overbought)"
+    if rsi <= 30:
+        return f"{rsi} (oversold)"
+    return f"{rsi} (neutral)"
+
+def macd_label(macd, signal) -> str:
+    if macd is None or signal is None:
+        return "n/a"
+    diff = abs(macd - signal)
+    if macd > signal:
+        return f"Bullish (above signal by {diff:.5f})"
+    return f"Bearish (below signal by {diff:.5f})"
+
+def trend_label(price: float, ema20, ema50) -> str:
+    if ema20 is None or ema50 is None:
+        return "n/a"
+    if price > ema20 > ema50:
+        return "Uptrend (price > EMA20 > EMA50)"
+    if price < ema20 < ema50:
+        return "Downtrend (price < EMA20 < EMA50)"
+    return "Mixed / ranging"
+
+def volume_label(ratio) -> str:
+    if ratio is None:
+        return "n/a"
+    if ratio >= 3.0:
+        return f"{ratio:.1f}x avg (strong spike ⚡)"
+    if ratio >= 2.0:
+        return f"{ratio:.1f}x avg (spike)"
+    if ratio >= 1.5:
+        return f"{ratio:.1f}x avg (elevated)"
+    return f"{ratio:.1f}x avg (normal)"
+
+# ─────────────────────────────
+# SIGNAL CONFIDENCE
+# Counts how many indicators agree with the bias (out of up to 7 now —
+# RSI, MACD, 15m trend, 1h trend, daily trend, volume, RSI divergence).
+# ─────────────────────────────
+def signal_confidence(data: dict, bias: str):
+    """Returns (score, total) where score = indicators agreeing with bias."""
+    score, total = 0, 0
+
+    rsi = data.get("rsi")
+    if rsi is not None:
+        total += 1
+        if bias == "BUY" and rsi < 65:
+            score += 1
+        elif bias == "SELL" and rsi > 35:
+            score += 1
+
+    macd_val = data.get("macd")
+    macd_sig = data.get("macd_signal")
+    if macd_val is not None and macd_sig is not None:
+        total += 1
+        if bias == "BUY" and macd_val > macd_sig:
+            score += 1
+        elif bias == "SELL" and macd_val < macd_sig:
+            score += 1
+
+    trend = data.get("trend", "")
+    if trend and trend != "n/a":
+        total += 1
+        if bias == "BUY" and "Uptrend" in trend:
+            score += 1
+        elif bias == "SELL" and "Downtrend" in trend:
+            score += 1
+
+    # 1h trend — multi-timeframe confirmation
+    hourly = data.get("hourly_trend", "")
+    if hourly and hourly != "n/a":
+        total += 1
+        if bias == "BUY" and "Uptrend" in hourly:
+            score += 1
+        elif bias == "SELL" and "Downtrend" in hourly:
+            score += 1
+
+    daily = data.get("daily_trend", "")
+    if daily and daily != "n/a":
+        total += 1
+        if bias == "BUY" and "Uptrend" in daily:
+            score += 1
+        elif bias == "SELL" and "Downtrend" in daily:
+            score += 1
+
+    vol = data.get("vol_ratio")
+    if vol is not None:
+        total += 1
+        if vol >= 1.5:
+            score += 1
+
+    # RSI divergence — bullish divergence supports BUY, bearish supports SELL.
+    # Only count when present (don't penalise signals that have no divergence).
+    divergence = data.get("divergence", "")
+    if divergence:
+        total += 1
+        if bias == "BUY" and divergence == "bullish":
+            score += 1
+        elif bias == "SELL" and divergence == "bearish":
+            score += 1
+
+    # VIX sentiment — extreme readings are contrarian signals.
+    # Only counted for non-crypto (VIX measures equity/macro fear, not crypto).
+    vix_price = data.get("vix_price")
+    is_crypto  = data.get("_is_crypto", False)
+    if vix_price is not None and not is_crypto:
+        total += 1
+        # Extreme fear (VIX >= 28) supports BUY — fear marks bottoms
+        # Extreme complacency (VIX <= 14) supports SELL — greed marks tops
+        if bias == "BUY" and vix_price >= 28:
+            score += 1
+        elif bias == "SELL" and vix_price <= 14:
+            score += 1
+
+    return score, total
+
+def confidence_bar(score: int, total: int) -> str:
+    filled = "●" * score
+    empty  = "○" * (total - score)
+    return f"{filled}{empty}"
+
+# ─────────────────────────────
+# STREAK TRACKING
+# ─────────────────────────────
+def get_streak_label(state: dict, symbol: str, current_bias: str = "") -> str:
+    """Show streak only when current signal extends it.
+
+    Old version showed e.g. 'BUY streak: 3' even when current signal was SELL,
+    which was misleading. Now we only show the streak when the current bias
+    matches, and project the count to include the current signal.
+    """
+    streaks = state.get("__streaks__", {})
+    s       = streaks.get(symbol, {})
+    count   = s.get("count", 0)
+    bias    = s.get("bias", "")
+    if not current_bias or bias != current_bias:
+        return ""
+    new_count = count + 1
+    if new_count < 2:
+        return ""
+    emoji = "✅" if current_bias == "BUY" else "🔴" if current_bias == "SELL" else "⚠️"
+    return f"{emoji} {current_bias} streak: {new_count} signals in a row\n"
+
+def update_streak(state: dict, symbol: str, bias: str):
+    if "__streaks__" not in state:
+        state["__streaks__"] = {}
+    s = state["__streaks__"].get(symbol, {"bias": "", "count": 0})
+    if s.get("bias") == bias:
+        s["count"] += 1
+    else:
+        s = {"bias": bias, "count": 1}
+    state["__streaks__"][symbol] = s
+
+# ─────────────────────────────
+# MULTI-SOURCE COUNTER
+# ─────────────────────────────
+def count_sources(title: str, story_counts: dict) -> int:
+    """Return how many outlets have reported a similar story."""
+    key = title.lower()[:150]
+    for existing_key, count in story_counts.items():
+        if SequenceMatcher(None, key, existing_key).ratio() >= 0.70:
+            return count
+    return 1
+
+# ─────────────────────────────
+# TRADINGVIEW CHART LINKS
+# ─────────────────────────────
+TRADINGVIEW_SYMBOLS = {
+    "GC=F":     "COMEX:GC1!",
+    "ALI=F":    "COMEX:ALI1!",
+    "CL=F":     "NYMEX:CL1!",
+    "^GSPC":    "SP:SPX",
+    "QQQ":      "NASDAQ:QQQ",
+    "GBPUSD=X": "FX:GBPUSD",
+    "EURUSD=X": "FX:EURUSD",
+    "BTC-USD":  "BITSTAMP:BTCUSD",
+    "ETH-USD":  "BITSTAMP:ETHUSD",
+}
+
+def chart_url(symbol: str) -> str:
+    tv = TRADINGVIEW_SYMBOLS.get(symbol, "")
+    if not tv:
+        return ""
+    return f"https://www.tradingview.com/chart/?symbol={tv}"
+
+# ─────────────────────────────
+# PRICE CACHE — 15-min bars
+# ─────────────────────────────
+_price_cache: dict = {}
+_fear_greed_cache = None
+
+def fetch_symbol_data(symbol: str):
+    """Return price + RSI + EMA + MACD + volume + S/R from 15-min bars."""
+    try:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?interval=15m&range=5d"
+        )
+        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+        result = r["chart"]["result"][0]
+        meta   = result.get("meta", {})
+        quote  = result["indicators"]["quote"][0]
+
+        closes  = [c for c in quote.get("close",  []) if c is not None]
+        highs   = [h for h in quote.get("high",   []) if h is not None]
+        lows    = [lo for lo in quote.get("low",  []) if lo is not None]
+        volumes = [v for v in quote.get("volume", []) if v is not None and v > 0]
+
+        if not closes:
+            return None
+
+        current    = meta.get("regularMarketPrice") or closes[-1]
+        prev_close = meta.get("chartPreviousClose")
+
+        if prev_close and prev_close > 0:
+            move = round((current - prev_close) / prev_close * 100, 2)
+        else:
+            move = 0.0
+
+        rsi   = calculate_rsi(closes)
+        ema20 = calculate_ema(closes, 20)
+        ema50 = calculate_ema(closes, 50)
+        trend = trend_label(current, ema20, ema50)
+
+        macd_val, macd_sig, macd_hist = calculate_macd(closes)
+
+        vol_ratio = None
+        if len(volumes) >= 2:
+            recent_vols = volumes[:-1][-20:]
+            avg_vol     = sum(recent_vols) / len(recent_vols) if recent_vols else 0
+            vol_ratio   = round(volumes[-1] / avg_vol, 2) if avg_vol > 0 else None
+
+        support    = round(min(lows[-30:]),  4) if len(lows)   >= 2 else None
+        resistance = round(max(highs[-30:]), 4) if len(highs)  >= 2 else None
+
+        # RSI divergence over the last 20 bars — flags weakening momentum
+        # before price actually reverses.
+        divergence = detect_divergence(closes)
+        atr        = calculate_atr(highs, lows, closes)
+
+        return {
+            "move":        move,
+            "price":       round(current, 4),
+            "rsi":         rsi,
+            "ema20":       ema20,
+            "ema50":       ema50,
+            "trend":       trend,
+            "macd":        macd_val,
+            "macd_signal": macd_sig,
+            "macd_hist":   macd_hist,
+            "vol_ratio":   vol_ratio,
+            "support":     support,
+            "resistance":  resistance,
+            "divergence":  divergence,  # "bullish", "bearish", or ""
+            "atr":         atr,         # Average True Range (15m bars)
+        }
+    except Exception as e:
+        print(f"  Data fetch failed for {symbol}: {e}")
+        return None
+
+def fetch_daily_context(symbol: str) -> dict:
+    """Return daily RSI + trend from 3-month daily bars (big-picture context)."""
+    try:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?interval=1d&range=3mo"
+        )
+        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+        result = r["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+        closes = [c for c in quote.get("close", []) if c is not None]
+        highs  = [h for h in quote.get("high",  []) if h is not None]
+        lows   = [lo for lo in quote.get("low", []) if lo is not None]
+        if not closes:
+            return {}
+        current       = closes[-1]
+        d_ema20       = calculate_ema(closes, 20)
+        d_ema50       = calculate_ema(closes, 50)
+        d_rsi         = calculate_rsi(closes)
+        d_trend       = trend_label(current, d_ema20, d_ema50)
+        d_support     = round(min(lows[-30:]),  4) if len(lows)  >= 2 else None
+        d_resistance  = round(max(highs[-30:]), 4) if len(highs) >= 2 else None
+        return {
+            "daily_trend":      d_trend,
+            "daily_rsi":        d_rsi,
+            "daily_support":    d_support,
+            "daily_resistance": d_resistance,
+        }
+    except Exception as e:
+        print(f"  Daily context failed for {symbol}: {e}")
+        return {}
+
+def fetch_hourly_context(symbol: str) -> dict:
+    """Return 1-hour timeframe trend + RSI for multi-timeframe confirmation.
+
+    The 15-minute timeframe used elsewhere catches every short-term wiggle and
+    fires false signals when the larger trend disagrees. Adding the 1h check
+    lets us require both timeframes to agree before classifying a signal as
+    high-confidence — eliminating most fakeouts.
+    """
+    try:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?interval=60m&range=1mo"
+        )
+        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+        result = r["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+        closes = [c for c in quote.get("close", []) if c is not None]
+        if not closes:
+            return {}
+        current = closes[-1]
+        h_ema20 = calculate_ema(closes, 20)
+        h_ema50 = calculate_ema(closes, 50)
+        h_rsi   = calculate_rsi(closes)
+        h_trend = trend_label(current, h_ema20, h_ema50)
+        return {
+            "hourly_trend": h_trend,
+            "hourly_rsi":   h_rsi,
+        }
+    except Exception as e:
+        print(f"  Hourly context failed for {symbol}: {e}")
+        return {}
+
+def detect_divergence(closes: list, period: int = 14, lookback: int = 20) -> str:
+    """Detect bullish/bearish RSI divergence over the recent window.
+
+    Bullish divergence: price made a lower low but RSI made a higher low →
+    selling pressure weakening, possible reversal up.
+    Bearish divergence: price made a higher high but RSI made a lower high →
+    buying pressure weakening, possible reversal down.
+
+    Returns "bullish", "bearish", or "" (no divergence / insufficient data).
+    """
+    if len(closes) < period + lookback + 2:
+        return ""
+
+    # Build RSI series
+    rsi_series = []
+    for end in range(period + 1, len(closes) + 1):
+        sub = closes[:end]
+        gains, losses = [], []
+        for i in range(1, len(sub)):
+            diff = sub[i] - sub[i - 1]
+            gains.append(max(diff, 0))
+            losses.append(max(-diff, 0))
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+        for i in range(period, len(sub) - 1):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi_val = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi_val = 100 - (100 / (1 + rs))
+        rsi_series.append(rsi_val)
+
+    # Compare last `lookback` bars
+    if len(rsi_series) < lookback:
+        return ""
+
+    recent_closes = closes[-lookback:]
+    recent_rsi    = rsi_series[-lookback:]
+
+    # Find the two extreme points (newest vs older) in the window
+    # Split the window in half to find a "previous" and "current" pivot
+    half = lookback // 2
+    older_lows_idx  = min(range(half), key=lambda i: recent_closes[i])
+    newer_lows_idx  = half + min(range(lookback - half), key=lambda i: recent_closes[half + i])
+    older_highs_idx = max(range(half), key=lambda i: recent_closes[i])
+    newer_highs_idx = half + max(range(lookback - half), key=lambda i: recent_closes[half + i])
+
+    # Bullish: lower low in price, higher low in RSI
+    if (recent_closes[newer_lows_idx] < recent_closes[older_lows_idx] and
+        recent_rsi[newer_lows_idx]    > recent_rsi[older_lows_idx] and
+        recent_rsi[newer_lows_idx]    < 50):  # divergence in oversold zone is more meaningful
+        return "bullish"
+
+    # Bearish: higher high in price, lower high in RSI
+    if (recent_closes[newer_highs_idx] > recent_closes[older_highs_idx] and
+        recent_rsi[newer_highs_idx]    < recent_rsi[older_highs_idx] and
+        recent_rsi[newer_highs_idx]    > 50):  # divergence in overbought zone is more meaningful
+        return "bearish"
+
+    return ""
+
+def fetch_fear_greed():
+    """Fetch Crypto Fear & Greed Index from alternative.me (free, no key)."""
+    global _fear_greed_cache
+    if _fear_greed_cache is not None:
+        return _fear_greed_cache
+    try:
+        r    = requests.get(
+            "https://api.alternative.me/fng/?limit=1",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=6,
+        ).json()
+        data = r["data"][0]
+        _fear_greed_cache = {
+            "value": int(data["value"]),
+            "label": data["value_classification"],
+        }
+        return _fear_greed_cache
+    except Exception as e:
+        print(f"  Fear & Greed fetch failed: {e}")
+        return None
+
+def fg_emoji(value: int) -> str:
+    if value <= 20:  return "😱"
+    if value <= 40:  return "😨"
+    if value <= 60:  return "😐"
+    if value <= 80:  return "😀"
+    return "🤑"
+
+def vix_label(vix: float) -> str:
+    """Human-readable VIX reading with emoji."""
+    if vix >= 35:  return f"😱 {vix:.1f} — Extreme Fear (markets panicking)"
+    if vix >= 25:  return f"😨 {vix:.1f} — Elevated Fear (high volatility)"
+    if vix >= 18:  return f"😐 {vix:.1f} — Neutral"
+    if vix >= 13:  return f"😀 {vix:.1f} — Low Fear (calm markets)"
+    return             f"🤑 {vix:.1f} — Extreme Complacency (danger zone)"
+
+def vix_signal_note(vix: float, bias: str) -> str:
+    """Return a short contrarian note when VIX is at an extreme and agrees with bias."""
+    if vix >= 30 and bias == "BUY":
+        return " — extreme fear often marks bottoms ✅"
+    if vix <= 13 and bias == "SELL":
+        return " — extreme complacency often precedes drops ✅"
+    if vix >= 30 and bias == "SELL":
+        return " — selling into panic, watch for reversal ⚠️"
+    if vix <= 13 and bias == "BUY":
+        return " — buying into complacency, tighter stops advised ⚠️"
+    return ""
+
+def refresh_price_cache():
+    global _price_cache
+    _price_cache = {}
+
+    # On weekends only fetch crypto + DXY — all other markets are closed
+    if is_weekend():
+        symbols = list(CRYPTO_SYMBOLS) + list(CONTEXT_SYMBOLS.keys())
+    else:
+        symbols = list(ASSET_MAP.keys()) + list(CONTEXT_SYMBOLS.keys())
+
+    for symbol in symbols:
+        data = fetch_symbol_data(symbol)
+        if data is not None:
+            if symbol in ASSET_MAP:
+                daily  = fetch_daily_context(symbol)
+                hourly = fetch_hourly_context(symbol)
+                data.update(daily)
+                data.update(hourly)
+            _price_cache[symbol] = data
+        time.sleep(0.5)
+
+    summary = {s: f"{d['move']:+.2f}% @ {d['price']}" for s, d in _price_cache.items()}
+    print(f"  Prices: {summary or 'all unavailable'}")
+
+def get_cached_moves(title: str) -> dict:
+    title_lower = title.lower()
+    weekend     = is_weekend()
+
+    # Macro events affect everything — but only tradeable assets for the current session
+    if is_macro(title_lower) and not weekend:
+        return {s: d for s, d in _price_cache.items() if s in ASSET_MAP}
+
+    # Try to match a specific asset from the headline
+    for sym, keywords in ASSET_MAP.items():
+        if weekend and sym not in CRYPTO_SYMBOLS:
+            continue  # Never return a closed market on weekends
+        if any(k in title_lower for k in keywords):
+            return {sym: _price_cache[sym]} if sym in _price_cache else {}
+
+    # Crypto headline with no specific asset match → default to BTC, never S&P
+    if is_crypto_headline(title_lower):
+        return {"BTC-USD": _price_cache["BTC-USD"]} if "BTC-USD" in _price_cache else {}
+    # Fallback — use BTC on weekends, S&P 500 on weekdays
+    if weekend:
+        return {"BTC-USD": _price_cache["BTC-USD"]} if "BTC-USD" in _price_cache else {}
+    return {"^GSPC": _price_cache["^GSPC"]} if "^GSPC" in _price_cache else {}
+
+# ─────────────────────────────
+# HEADLINE AGE FILTER
+# ─────────────────────────────
+def is_fresh(entry) -> bool:
+    try:
+        raw = entry.get("published") or entry.get("updated")
+        if not raw:
+            return True
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (now_utc() - dt) <= timedelta(minutes=MAX_HEADLINE_AGE_MIN)
+    except Exception:
+        return True
+
+# ─────────────────────────────
+# ECONOMIC CALENDAR
+# ─────────────────────────────
+_calendar_cache = None
+
+def fetch_calendar() -> list:
+    global _calendar_cache
+    if _calendar_cache is not None:
+        return _calendar_cache
+    try:
+        url    = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8).json()
+        today  = now_utc().strftime("%Y-%m-%d")
+        events = []
+        for e in r:
+            if e.get("impact") == "High" and e.get("date", "").startswith(today):
+                events.append({
+                    "title":    e.get("title", ""),
+                    "currency": e.get("currency", ""),
+                    "time":     e.get("date", "")[-8:-3] + " UTC",
+                })
+        _calendar_cache = events
+        if events:
+            print(f"  Calendar: {len(events)} high-impact events today")
+        return events
+    except Exception as e:
+        print(f"  Calendar fetch failed: {e}")
+        _calendar_cache = []
+        return []
+
+# ─────────────────────────────
+# DUPLICATE STORY FILTER
+# ─────────────────────────────
+def is_duplicate(title: str, recent: list) -> bool:
+    t = title.lower()[:200]
+    for s in recent[-50:]:
+        if SequenceMatcher(None, t, s.lower()[:200]).ratio() >= SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+# ─────────────────────────────
+# STATE
+# ─────────────────────────────
+def load_state() -> dict:
+    try:
+        with open(SEEN_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {
+                "seen_headlines":       data,
+                "__cooldowns__":        {},
+                "__weekly_signals__":   [],
+                "__weekly_sent_week__": 0,
+                "__heartbeat_day__":    0,
+                "__streaks__":          {},
+            }
+        if isinstance(data, dict) and "headlines" in data:
+            data["seen_headlines"] = data.pop("headlines", [])
+        data.setdefault("seen_headlines",           [])
+        data.setdefault("__cooldowns__",            {})
+        data.setdefault("__weekly_signals__",       [])
+        data.setdefault("__weekly_sent_week__",     0)
+        data.setdefault("__heartbeat_day__",        0)
+        data.setdefault("__streaks__",              {})
+        data.setdefault("__event_warnings_sent__",  {})
+        data.setdefault("__last_breakouts__",       {})
+        data.setdefault("__last_prices__",          {})
+        return data
+    except Exception:
+        return {
+            "seen_headlines":           [],
+            "__cooldowns__":            {},
+            "__weekly_signals__":       [],
+            "__weekly_sent_week__":     0,
+            "__heartbeat_day__":        0,
+            "__streaks__":              {},
+            "__event_warnings_sent__":  {},
+            "__last_breakouts__":       {},
+            "__last_prices__":          {},
+        }
+
+def save_state(state: dict):
+    try:
+        state["seen_headlines"]     = state["seen_headlines"][-500:]
+        state["__weekly_signals__"] = state["__weekly_signals__"][-200:]
+        # Prune cooldowns that have already expired so the dict stays small
+        cutoff = now_utc() - timedelta(minutes=SYMBOL_COOLDOWN_MIN * 2)
+        pruned = {}
+        for sym, ts in state.get("__cooldowns__", {}).items():
+            try:
+                if datetime.fromisoformat(ts) > cutoff:
+                    pruned[sym] = ts
+            except Exception:
+                pass
+        state["__cooldowns__"] = pruned
+        with open(SEEN_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"  Could not save state: {e}")
+
+# ─────────────────────────────
+# SIGNAL COOLDOWN
+# ─────────────────────────────
+def cooldown_active(symbol: str, cooldowns: dict) -> bool:
+    last_str = cooldowns.get(symbol)
+    if not last_str:
+        return False
+    try:
+        last = datetime.fromisoformat(last_str)
+        return (now_utc() - last) < timedelta(minutes=SYMBOL_COOLDOWN_MIN)
+    except Exception:
+        return False
+
+# ─────────────────────────────
+# PRIMARY SYMBOL
+# ─────────────────────────────
+def get_primary_symbol(title: str, moves: dict) -> str:
+    for sym, keywords in ASSET_MAP.items():
+        if any(k in title.lower() for k in keywords) and sym in moves:
+            return sym
+    # Crypto headline with no specific match → BTC, never S&P 500
+    if is_crypto_headline(title):
+        return "BTC-USD"
+    if moves:
+        return max(moves, key=lambda s: abs(moves[s]["move"]))
+    # Safe fallback — never return a closed market on weekends
+    return "BTC-USD" if is_weekend() else "^GSPC"
+
+# ─────────────────────────────
+# SCORING
+# ─────────────────────────────
+ENERGY_KEYWORDS = [
+    "oil", "crude", "wti", "brent", "opec", "petroleum", "energy",
+    "gold", "xau", "bullion", "precious metal",
+    "aluminium", "aluminum", "alcoa", "bauxite",
+]
+
+def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
+    avg_move   = sum(abs(d["move"]) for d in moves.values()) / len(moves) if moves else 0
+    api_failed = len(moves) == 0
+    crypto     = signal_type == "🪙 CRYPTO" or is_crypto_headline(title)
+
+    # ── Unified freshness thresholds ────────────────────────────────────────
+    # Previously crypto had 3-4x looser thresholds than non-crypto, causing
+    # crude/forex to score near-zero whenever they were already moving — exactly
+    # when signals are most needed. Now every asset class uses the same scale.
+    if avg_move < 1.0:   freshness, reaction = 50, "FRESH"
+    elif avg_move < 2.5: freshness, reaction = 40, "WARMING"
+    elif avg_move < 5.0: freshness, reaction = 25, "MOVING"
+    elif avg_move < 8.0: freshness, reaction = 10, "RUNNING"
+    else:                freshness, reaction = 0,  "PRICED IN"
+
+    # ── Bonuses ─────────────────────────────────────────────────────────────
+    macro_bonus  = 20 if is_macro(title) else 0
+    # Energy/commodity bonus — matches macro_bonus so oil/gold aren't ignored
+    energy_bonus = 15 if any(k in title.lower() for k in ENERGY_KEYWORDS) else 0
+    # Crypto bonus halved — crypto feeds (6 feeds) already generate far more
+    # volume than commodity/forex feeds; +20 was creating a ~30pt unfair advantage
+    crypto_bonus   = 10 if crypto else 0
+    analysis_bonus = 10 if signal_type == "📊 ANALYSIS" else 0
+    breadth_bonus  = 10 if api_failed else min(20, len(moves) * 4)
+    source_bonus   = min(20, (src_count - 1) * 7)
+
+    vol_bonus = 0
+    for d in moves.values():
+        if (d.get("vol_ratio") or 0) >= 2.0:
+            vol_bonus = 10
+            break
+
+    total = min(100, freshness + macro_bonus + energy_bonus + crypto_bonus
+                     + analysis_bonus + breadth_bonus + source_bonus + vol_bonus)
+    return total, reaction
+
+def label(s: int) -> str:
+    if s < 40:  return "🟥 NO TRADE"
+    if s < 55:  return "🟠 WEAK"
+    if s < 70:  return "🟡 WATCH"
+    if s < 85:  return "🟢 GOOD SETUP"
+    return "🔥 HIGH CONVICTION"
+
+# ─────────────────────────────
+# AI ANALYSIS
+# ─────────────────────────────
+def analyze(title: str, reaction: str, moves: dict, signal_type: str,
+            calendar_events: list, primary_symbol: str = "") -> str:
+
+    if moves:
+        rows = []
+        for s, d in moves.items():
+            if s not in ASSET_MAP:
+                continue
+            row = (
+                f"  {friendly(s)}: {d['move']:+.2f}% today | price: {d['price']}"
+                f" | RSI(14): {rsi_label(d.get('rsi'))}"
+                f" | Trend: {d.get('trend', 'n/a')}"
+            )
+            if d.get("ema20"):
+                row += f" | EMA20: {d['ema20']}"
+            if d.get("ema50"):
+                row += f" | EMA50: {d['ema50']}"
+            rows.append(row)
+        prices_str = "\n".join(rows) if rows else "  prices unavailable"
+    else:
+        prices_str = "  prices unavailable"
+
+    if calendar_events:
+        cal_str = ", ".join([f"{e['title']} ({e['currency']})" for e in calendar_events[:4]])
+    else:
+        cal_str = "none"
+
+    macro_note  = "This is a macro event — consider all instruments." if is_macro(title) else ""
+    crypto_note = "This is a crypto headline — focus on Bitcoin (BTC/USD) and Ethereum (ETH/USD)." if is_crypto_headline(title) else ""
+
+    # Inject market fear context into prompt
+    vix_d = _price_cache.get("^VIX")
+    if vix_d and primary_symbol not in CRYPTO_SYMBOLS:
+        vix_context = f"Market fear gauge — VIX: {vix_d.get('price', 'n/a')} ({vix_label(vix_d.get('price', 0)) if vix_d.get('price') else 'n/a'})"
+    elif primary_symbol in CRYPTO_SYMBOLS:
+        fg = fetch_fear_greed()
+        vix_context = f"Crypto Fear & Greed: {fg['value']} — {fg['label']}" if fg else ""
+    else:
+        vix_context = ""
+
+    prompt = f"""You are a professional macro and crypto trading analyst.
+
+Headline: {title}
+Signal type: {signal_type}
+Market reaction so far: {reaction}
+Today's high-impact scheduled events: {cal_str}
+{vix_context}
+{macro_note}{crypto_note}
+
+Live market data (today's intraday move + current price):
+{prices_str}
+
+My watchlist: Gold (XAU/USD), Aluminium (ALI/USD), Crude Oil (WTI), S&P 500, US Tech 100 (Nasdaq), GBP/USD, EUR/USD, Bitcoin (BTC/USD), Ethereum (ETH/USD)
+
+IMPORTANT: Always use full plain-English names. Never use ticker codes like QQQ, SPX, CL, GC, DXY, NQ, ES, BTC, ETH — write "US Tech 100 (Nasdaq)", "S&P 500", "Crude Oil (WTI)", "Gold (XAU/USD)", "Bitcoin (BTC/USD)", "Ethereum (ETH/USD)" etc.
+
+The PRIMARY instrument for this signal is: {friendly(primary_symbol) if primary_symbol else "the most affected asset"}
+
+Return EXACTLY this format, no extra text:
+BIAS: BUY / SELL / NEUTRAL
+IMPACT: [1-10 integer — how market-moving is this news]
+AFFECTS: [full plain-English names of affected instruments, no tickers]
+REASON: [2-3 direct sentences explaining the trade logic in plain English]
+ENTRY: [price level or range for {friendly(primary_symbol) if primary_symbol else "primary instrument"} ONLY — numbers only, e.g. 1.3520 or 1.3520-1.3540, no other assets]
+STOP: [stop loss for {friendly(primary_symbol) if primary_symbol else "primary instrument"} ONLY — single number]
+TARGET: [profit target for {friendly(primary_symbol) if primary_symbol else "primary instrument"} ONLY — single number or range]
+WATCH: [key level or upcoming catalyst in plain English]"""
+
+    try:
+        res = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return res.content[0].text
+    except Exception as e:
+        print(f"  AI error: {e}")
+        return "BIAS: NEUTRAL\nIMPACT: 5\nAFFECTS: unknown\nREASON: AI unavailable\nENTRY: n/a\nSTOP: n/a\nTARGET: n/a\nWATCH: n/a"
+
+def parse_ai(ai_text: str) -> dict:
+    """Extract AI response fields with line-anchored regex.
+
+    Old implementation used `text.split("KEY:")` which collided when a key
+    name appeared inside another field's value (e.g. AI writes "TARGET: 100"
+    inside REASON, then TARGET parses the wrong text). The line-anchored
+    regex below only matches a key at the start of a line, so casual
+    mentions inside values are ignored.
+    """
+    fields  = {"BIAS": "", "IMPACT": "5", "AFFECTS": "",
+               "REASON": "", "ENTRY": "", "STOP": "", "TARGET": "", "WATCH": ""}
+    key_alt = "|".join(fields.keys())
+    pattern = rf'^\s*({key_alt}):\s*(.*?)(?=\n\s*(?:{key_alt}):|\Z)'
+    for match in re.finditer(pattern, ai_text, re.MULTILINE | re.DOTALL | re.IGNORECASE):
+        key = match.group(1).upper()
+        if key in fields:
+            fields[key] = match.group(2).strip()
+    return fields
+
+def parse_impact(raw: str) -> int:
+    try:
+        return max(1, min(10, int("".join(c for c in raw if c.isdigit())[:2])))
+    except Exception:
+        return 5
+
+# ─────────────────────────────
+# TICKER REPLACER
+# ─────────────────────────────
+TICKER_REPLACEMENTS = {
+    "QQQ":    "US Tech 100 (Nasdaq)",
+    "SPX":    "S&P 500",
+    "SPY":    "S&P 500",
+    "ES":     "S&P 500",
+    "NQ":     "US Tech 100 (Nasdaq)",
+    "ALI":    "Aluminium (ALI/USD)",
+    "CL":     "Crude Oil (WTI)",
+    "WTI":    "Crude Oil (WTI)",
+    "GC":     "Gold (XAU/USD)",
+    "XAU":    "Gold (XAU/USD)",
+    "DXY":    "US Dollar Index",
+    "GBP":    "GBP/USD (Pound)",
+    "EUR":    "EUR/USD (Euro)",
+    "EURUSD": "EUR/USD (Euro)",
+    "GBPUSD": "GBP/USD (Pound)",
+    "BTCUSD": "Bitcoin (BTC/USD)",
+    "ETHUSD": "Ethereum (ETH/USD)",
+}
+
+def replace_tickers(text: str) -> str:
+    for ticker, name in TICKER_REPLACEMENTS.items():
+        if ticker in ("GBP", "EUR"):
+            # Negative lookahead: don't replace when followed by "/" so
+            # "GBP/USD" stays intact but standalone "GBP" gets replaced.
+            text = re.sub(rf'\b{ticker}\b(?!/)', name, text, flags=re.IGNORECASE)
+        else:
+            # Negative lookbehind: don't replace when preceded by "(" so
+            # "Crude Oil (WTI)" or "Gold (XAU/USD)" are left untouched —
+            # the ticker is already embedded inside its own friendly name.
+            text = re.sub(rf'(?<!\()\b{ticker}\b', name, text, flags=re.IGNORECASE)
+    return text
+
+def sanitize(text: str) -> str:
+    text = replace_tickers(text)
+    return (
+        text
+        .replace("*", "")
+        .replace("_", " ")
+        .replace("`", "'")
+        .replace("[", "(")
+        .replace("]", ")")
+    )
+
+# ─────────────────────────────
+# KEY LEVEL TRAP CHECK
+# ─────────────────────────────
+def is_at_trap_level(bias: str, primary_data: dict, threshold_pct: float = 0.4) -> tuple:
+    """Detect signals that would buy at resistance or sell at support.
+
+    Returns (is_trap, reason). Buying right at resistance (or selling right
+    at support) is the classic retail trap — odds favour rejection. We block
+    these even if the headline and AI both say BUY/SELL.
+
+    threshold_pct: how close (in %) we consider "at" the level. 0.4% by default.
+    """
+    if bias not in ("BUY", "SELL"):
+        return False, ""
+    price = primary_data.get("price")
+    if not price or price <= 0:
+        return False, ""
+
+    if bias == "BUY":
+        r15 = primary_data.get("resistance")
+        if r15 and r15 > price:
+            distance_pct = (r15 - price) / price * 100
+            if distance_pct <= threshold_pct:
+                return True, f"BUY blocked — price ({price}) is {distance_pct:.2f}% below 15m resistance ({r15}). Risk of immediate rejection."
+    else:  # SELL
+        s15 = primary_data.get("support")
+        if s15 and s15 < price:
+            distance_pct = (price - s15) / price * 100
+            if distance_pct <= threshold_pct:
+                return True, f"SELL blocked — price ({price}) is {distance_pct:.2f}% above 15m support ({s15}). Risk of immediate bounce."
+    return False, ""
+
+# ─────────────────────────────
+# TRADE LEVELS (programmatic — anchored to support/resistance)
+# ─────────────────────────────
+def compute_trade_levels(bias: str, primary_data: dict) -> dict:
+    """Compute Entry/SL/TP from price + 15m and daily support/resistance.
+
+    AI-generated levels frequently violated the bot's own technical levels
+    (e.g. SELL stop placed below resistance, BUY target placed beyond
+    resistance with no breakout logic, target inside the support zone we'd
+    expect to hold). This function replaces those with rule-based levels
+    that always respect S/R:
+
+      - Entry: tight ±0.15% range around current price.
+      - BUY  SL: just below 15m support (0.15% buffer); falls back to daily
+        support, else a 1% safety stop.
+      - SELL SL: just above 15m resistance (0.15% buffer); falls back to
+        daily resistance, else a 1% safety stop.
+      - TP1 (conservative): the nearest S/R giving at least 1R reward,
+        otherwise a 1.5R extension.
+      - TP2 (aggressive): a 2.5R extension capped at 3.5R; or daily S/R
+        if it sits between TP1 and the cap.
+      - Always enforces SL on the loss side, TP on the profit side, and
+        formats decimals based on price magnitude.
+
+    Returns {} if bias is non-directional or price is missing.
+    """
+    price = primary_data.get("price")
+    if not price or price <= 0 or bias not in ("BUY", "SELL"):
+        return {}
+
+    s15 = primary_data.get("support")
+    r15 = primary_data.get("resistance")
+    sd  = primary_data.get("daily_support")
+    rd  = primary_data.get("daily_resistance")
+    atr = primary_data.get("atr")
+
+    # ATR-aware buffer: at least 0.15% of price, but scales up with volatility
+    # (half an ATR) so stops aren't too tight in fast-moving markets.
+    buf = max(price * 0.0015, (atr * 0.5) if atr else 0)
+
+    # Decimal precision based on price magnitude
+    if   price >= 1000: dec = 1
+    elif price >= 10:   dec = 2
+    elif price >= 1:    dec = 4
+    else:               dec = 5
+    fmt = lambda n: f"{n:.{dec}f}"
+
+    if bias == "BUY":
+        entry_lo = price * 0.999
+        entry_hi = price * 1.0015
+
+        # SL: below support (must be below current price)
+        if s15 and s15 < price * 0.998:
+            sl = s15 - buf
+        elif sd and sd < price * 0.99:
+            sl = sd - buf
+        else:
+            sl = price * 0.99  # 1% safety stop
+
+        risk = price - sl
+        if risk <= 0:
+            sl = price * 0.99
+            risk = price - sl
+
+        min_tp = price + risk * 1.0   # any TP must be at least 1R
+        max_tp = price + risk * 3.5   # cap on far target
+
+        # TP1: nearest meaningful resistance giving 1R+, else 1.5R extension
+        tp1_candidates = []
+        if r15 and (r15 - buf) >= min_tp:
+            tp1_candidates.append(r15 - buf)
+        if rd and (rd - buf) >= min_tp and (rd - buf) <= max_tp:
+            tp1_candidates.append(rd - buf)
+        tp1 = min(tp1_candidates) if tp1_candidates else (price + risk * 1.5)
+
+        # TP2: 2.5R extension, or daily resistance if between TP1 and cap
+        tp2 = price + risk * 2.5
+        if rd and (rd - buf) > tp1 and (rd - buf) <= max_tp:
+            tp2 = max(tp2, rd - buf)
+        tp2 = min(tp2, max_tp)
+
+        if tp2 > tp1 * 1.003:  # ranges only when meaningfully apart
+            target = f"{fmt(tp1)}-{fmt(tp2)}"
+        else:
+            target = fmt(tp1)
+
+        return {
+            "entry":  f"{fmt(entry_lo)}-{fmt(entry_hi)}",
+            "stop":   fmt(sl),
+            "target": target,
+        }
+
+    # SELL
+    entry_lo = price * 0.9985
+    entry_hi = price * 1.001
+
+    if r15 and r15 > price * 1.002:
+        sl = r15 + buf
+    elif rd and rd > price * 1.01:
+        sl = rd + buf
+    else:
+        sl = price * 1.01
+
+    risk = sl - price
+    if risk <= 0:
+        sl = price * 1.01
+        risk = sl - price
+
+    min_tp = price - risk * 1.0   # any TP must be at least 1R below
+    max_tp = price - risk * 3.5   # furthest TP allowed
+
+    tp1_candidates = []
+    if s15 and (s15 + buf) <= min_tp:
+        tp1_candidates.append(s15 + buf)
+    if sd and (sd + buf) <= min_tp and (sd + buf) >= max_tp:
+        tp1_candidates.append(sd + buf)
+    tp1 = max(tp1_candidates) if tp1_candidates else (price - risk * 1.5)
+
+    tp2 = price - risk * 2.5
+    if sd and (sd + buf) < tp1 and (sd + buf) >= max_tp:
+        tp2 = min(tp2, sd + buf)
+    tp2 = max(tp2, max_tp)
+
+    if tp1 > tp2 * 1.003:
+        target = f"{fmt(tp2)}-{fmt(tp1)}"  # smaller-larger reads naturally
+    else:
+        target = fmt(tp1)
+
+    return {
+        "entry":  f"{fmt(entry_lo)}-{fmt(entry_hi)}",
+        "stop":   fmt(sl),
+        "target": target,
+    }
+
+# ─────────────────────────────
+# FORMAT MESSAGE
+# ─────────────────────────────
+def format_msg(title, reaction, base_score, moves, primary_symbol,
+               ai_text, signal_type, calendar_events,
+               state, src_count=1) -> str:
+
+    ai     = parse_ai(ai_text)
+    bias   = sanitize(ai["BIAS"]).strip().upper()
+    impact = parse_impact(ai["IMPACT"])
+
+    bonus       = max(0, (impact - 5) * 2)
+    final_score = min(100, base_score + bonus)
+
+    if bias == "BUY":
+        action = f"✅ BUY — {friendly(primary_symbol)}"
+    elif bias == "SELL":
+        action = f"🔴 SELL — {friendly(primary_symbol)}"
+    else:
+        action = f"⚠️ WATCH — {friendly(primary_symbol)}"
+
+    # Live moves (primary instruments only)
+    if moves:
+        moves_lines = "\n".join([
+            f"  {friendly(s)}: {d['move']:+.2f}% | "
+            f"{'$' if s not in FOREX_SYMBOLS else ''}{d['price']}"
+            for s, d in moves.items()
+            if s in ASSET_MAP
+        ])
+    else:
+        moves_lines = "  prices unavailable"
+
+    # Trade levels — computed programmatically from price + S/R so they
+    # always respect the bot's own technicals (AI levels often violated them).
+    # AI levels are used only as a last-resort fallback if computation fails
+    # (e.g. missing price data on a directional signal).
+    primary_data = dict(moves.get(primary_symbol, {}))  # copy so we can annotate safely
+
+    # Inject VIX and crypto flag into primary_data so signal_confidence can use them
+    vix_data = _price_cache.get("^VIX")
+    if vix_data:
+        primary_data["vix_price"] = vix_data.get("price")
+    primary_data["_is_crypto"] = primary_symbol in CRYPTO_SYMBOLS
+
+    computed_levels = compute_trade_levels(bias, primary_data)
+    if computed_levels:
+        entry  = computed_levels["entry"]
+        stop   = computed_levels["stop"]
+        target = computed_levels["target"]
+        has_levels = True
+    else:
+        entry  = sanitize(ai.get("ENTRY", "n/a"))
+        stop   = sanitize(ai.get("STOP",  "n/a"))
+        target = sanitize(ai.get("TARGET","n/a"))
+        placeholders = {"n/a", "", "n.a.", "tbd", "tba", "unknown", "none", "?", "??"}
+        def _has_real_level(v: str) -> bool:
+            return v.strip().lower() not in placeholders and bool(re.search(r'\d', v))
+        has_levels = all(_has_real_level(v) for v in [entry, stop, target])
+    levels_section = (
+        f"📌 *Trade levels ({friendly(primary_symbol)}):*\n"
+        f"  Entry:     {entry}\n"
+        f"  Stop Loss: {stop}\n"
+        f"  Target:    {target}\n\n"
+    ) if has_levels else ""
+
+    # Calendar
+    cal_section = ""
+    if calendar_events:
+        cal_items   = " | ".join([f"{e['title']} ({e['currency']})" for e in calendar_events[:3]])
+        cal_section = f"📅 *High-impact events today:* {cal_items}\n\n"
+
+    # Technical analysis — 15-min (intraday). primary_data already set above.
+    ta_lines = []
+    if primary_data.get("rsi") is not None:
+        ta_lines.append(f"  RSI(14):    {rsi_label(primary_data['rsi'])}")
+    ta_lines.append(f"  MACD:       {macd_label(primary_data.get('macd'), primary_data.get('macd_signal'))}")
+    ta_lines.append(f"  Trend:      {primary_data.get('trend', 'n/a')}")
+    if primary_data.get("vol_ratio") is not None:
+        ta_lines.append(f"  Volume:     {volume_label(primary_data['vol_ratio'])}")
+    if primary_data.get("support") is not None:
+        ta_lines.append(f"  Support:    {primary_data['support']}")
+    if primary_data.get("resistance") is not None:
+        ta_lines.append(f"  Resistance: {primary_data['resistance']}")
+    divergence = primary_data.get("divergence", "")
+    if divergence:
+        emoji = "🟢" if divergence == "bullish" else "🔴"
+        ta_lines.append(f"  Divergence: {emoji} {divergence.upper()} (RSI signaling possible reversal)")
+    ta_section = "📈 *Technical (15m):*\n" + "\n".join(ta_lines) + "\n\n" if ta_lines else ""
+
+    # Hourly trend — multi-timeframe confirmation
+    hourly_section = ""
+    h_trend = primary_data.get("hourly_trend", "")
+    h_rsi   = primary_data.get("hourly_rsi")
+    if h_trend or h_rsi is not None:
+        h_lines = []
+        if h_trend:
+            # Flag alignment / disagreement with 15m
+            t15 = primary_data.get("trend", "")
+            agree_marker = ""
+            if "Uptrend" in t15 and "Uptrend" in h_trend:
+                agree_marker = " ✅ aligned with 15m"
+            elif "Downtrend" in t15 and "Downtrend" in h_trend:
+                agree_marker = " ✅ aligned with 15m"
+            elif (("Uptrend" in t15 and "Downtrend" in h_trend) or
+                  ("Downtrend" in t15 and "Uptrend" in h_trend)):
+                agree_marker = " ⚠️ disagrees with 15m"
+            h_lines.append(f"  Trend:   {h_trend}{agree_marker}")
+        if h_rsi is not None:
+            h_lines.append(f"  RSI(14): {rsi_label(h_rsi)}")
+        if h_lines:
+            hourly_section = "⏱ *Hourly (1h) context:*\n" + "\n".join(h_lines) + "\n\n"
+
+    # Daily context
+    daily_lines = []
+    if primary_data.get("daily_trend"):
+        daily_lines.append(f"  Trend:   {primary_data['daily_trend']}")
+    if primary_data.get("daily_rsi") is not None:
+        daily_lines.append(f"  RSI(14): {rsi_label(primary_data['daily_rsi'])}")
+    if primary_data.get("daily_support") is not None:
+        daily_lines.append(f"  Support: {primary_data['daily_support']}")
+    if primary_data.get("daily_resistance") is not None:
+        daily_lines.append(f"  Resist:  {primary_data['daily_resistance']}")
+    daily_section = "🗓 *Daily chart context:*\n" + "\n".join(daily_lines) + "\n\n" if daily_lines else ""
+
+    # Signal confidence
+    conf_score, conf_total = signal_confidence(primary_data, bias)
+    conf_bar     = confidence_bar(conf_score, conf_total)
+    # Only show confidence for directional signals — WATCH/NEUTRAL always score 0 which is misleading
+    conf_section = f"💪 *Confidence: {conf_score}/{conf_total} indicators aligned* |{conf_bar}|\n\n" if (conf_total > 0 and bias in ("BUY", "SELL")) else ""
+
+    # Streak — only displayed when current bias extends an existing streak
+    streak_section = get_streak_label(state, primary_symbol, bias)
+    if streak_section:
+        streak_section += "\n"
+
+    # Fear & Greed — crypto uses the Crypto F&G index; all other assets use VIX
+    fg_section = ""
+    if primary_symbol in CRYPTO_SYMBOLS:
+        fg = fetch_fear_greed()
+        if fg:
+            emoji = fg_emoji(fg["value"])
+            fg_section = f"{emoji} *Crypto Fear & Greed: {fg['value']} — {fg['label']}*\n\n"
+    elif vix_data:
+        vix_price = vix_data.get("price")
+        if vix_price:
+            note = vix_signal_note(vix_price, bias)
+            fg_section = f"📊 *Market Fear (VIX):* {vix_label(vix_price)}{note}\n\n"
+
+    # DXY context (macro/forex signals)
+    dxy_section = ""
+    is_forex_or_macro = is_macro(title) or primary_symbol in {"GBPUSD=X", "EURUSD=X"}
+    if is_forex_or_macro and "DX-Y.NYB" in _price_cache:
+        dxy = _price_cache["DX-Y.NYB"]
+        dxy_section = (
+            f"💵 *US Dollar Index (DXY):* {dxy['price']} ({dxy['move']:+.2f}% today)"
+            f" | {dxy.get('trend', 'n/a')}\n\n"
+        )
+
+    # Multi-source
+    source_section = ""
+    if src_count >= 2:
+        source_section = f"📡 *{src_count} outlets reporting this story*\n\n"
+
+    # TradingView chart
+    cv_url = chart_url(primary_symbol)
+    chart_section = f"🔗 [View chart on TradingView]({cv_url})\n\n" if cv_url else ""
+
+    return (
+        f"{'─' * 28}\n"
+        f"{action}\n"
+        f"{'─' * 28}\n\n"
+        f"⏰ {now_utc().strftime('%H:%M UTC')} | {get_session_label()}\n"
+        f"📊 Signal strength: {label(final_score)} ({final_score}/100)\n"
+        f"⚡ AI impact rating: {impact}/10\n"
+        f"⚖️ Market reaction: {reaction}\n\n"
+        f"{streak_section}"
+        f"{conf_section}"
+        f"{source_section}"
+        f"{cal_section}"
+        f"📰 *What happened:*\n{sanitize(title)}\n\n"
+        f"💡 *Why trade this:*\n{sanitize(ai['REASON'])}\n\n"
+        f"{levels_section}"
+        f"{fg_section}"
+        f"{dxy_section}"
+        f"{ta_section}"
+        f"{hourly_section}"
+        f"{daily_section}"
+        f"🎯 *Assets affected:*\n{sanitize(ai['AFFECTS'])}\n\n"
+        f"👀 *Watch for:*\n{sanitize(ai['WATCH'])}\n\n"
+        f"💹 *Live moves:*\n{moves_lines}\n\n"
+        f"{chart_section}"
+        f"{'─' * 28}\n"
+        f"{signal_type}"
+    )
+
+# ─────────────────────────────
+# TELEGRAM
+# ─────────────────────────────
+def send_telegram(msg: str, retries: int = 3) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for attempt in range(retries):
+        try:
+            r    = requests.post(
+                url,
+                data={
+                    "chat_id":                  CHAT_ID,
+                    "text":                     msg,
+                    "parse_mode":               "Markdown",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=10,
+            )
+            data = r.json()
+            if r.status_code == 200 and data.get("ok"):
+                return True
+            print(f"  Telegram error (attempt {attempt + 1}): {data}")
+        except Exception as e:
+            print(f"  Telegram attempt {attempt + 1} exception: {e}")
+        time.sleep(3)
+    print("  All Telegram retries exhausted.")
+    return False
+
+# ─────────────────────────────
+# HEARTBEAT — once per day at 7 AM UTC
+# ─────────────────────────────
+def maybe_send_heartbeat(state: dict, calendar_events: list):
+    now   = now_utc()
+    today = now.date().toordinal()
+    if state.get("__heartbeat_day__") == today:
+        return
+    if now.hour != 7:
+        return
+    cal_line = ""
+    if calendar_events:
+        events_str = ", ".join([f"{e['title']} ({e['currency']})" for e in calendar_events])
+        cal_line   = f"\n📅 *High-impact events today:* {events_str}"
+
+    # Only mark done if Telegram actually confirms delivery
+    if send_telegram(
+        f"💓 *Bot alive* — {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Threshold: {SCORE_THRESHOLD}/100 | Cooldown: {SYMBOL_COOLDOWN_MIN}min/symbol\n"
+        f"Watching {len(ASSET_MAP)} assets across {len(ALL_FEEDS)} feeds"
+        f"{cal_line}"
+    ):
+        state["__heartbeat_day__"] = today
+
+# ─────────────────────────────
+# WEEKLY SUMMARY — Monday 7 AM UTC
+# ─────────────────────────────
+def maybe_send_weekly_summary(state: dict):
+    now  = now_utc()
+    if now.weekday() != 0 or now.hour != 7:
+        return
+
+    current_week = now.isocalendar()[1]
+    if state.get("__weekly_sent_week__") == current_week:
+        return
+
+    signals = state.get("__weekly_signals__", [])
+    if not signals:
+        state["__weekly_sent_week__"] = current_week
+        return
+
+    week_ago = now - timedelta(days=7)
+    recent   = [
+        s for s in signals
+        if datetime.fromisoformat(s["ts"]) > week_ago
+    ]
+
+    if not recent:
+        state["__weekly_sent_week__"] = current_week
+        return
+
+    buys    = sum(1 for s in recent if "BUY" in s.get("bias", "").upper())
+    sells   = sum(1 for s in recent if "SELL" in s.get("bias", "").upper())
+    neutral = len(recent) - buys - sells
+    top5    = sorted(recent, key=lambda x: x.get("score", 0), reverse=True)[:5]
+
+    lines = [
+        f"📊 *Weekly Signal Summary*",
+        f"Week of {(now - timedelta(days=7)).strftime('%b %d')} — {now.strftime('%b %d, %Y')}",
+        f"",
+        f"Total signals: {len(recent)}",
+        f"✅ BUY: {buys}  |  🔴 SELL: {sells}  |  ⚠️ WATCH: {neutral}",
+        f"",
+        f"*Top signals this week:*",
+    ]
+    for s in top5:
+        bias_upper = s.get("bias", "").upper()
+        emoji = "✅" if "BUY" in bias_upper else "🔴" if "SELL" in bias_upper else "⚠️"
+        lines.append(
+            f"{emoji} {s.get('symbol', '?')} ({s.get('score', 0)}/100) — "
+            f"{s.get('headline', '')[:55]}"
+        )
+
+    if send_telegram("\n".join(lines)):
+        state["__weekly_sent_week__"] = current_week
+        state["__weekly_signals__"]   = []
+
+# ─────────────────────────────
+# PRICE MOVEMENT ALERTS
+# ─────────────────────────────
+# Thresholds: how much an asset must move since the LAST bot run to fire an alert.
+PRICE_ALERT_THRESHOLDS = {
+    "GC=F":     1.0,   # Gold     — alert on 1%+ move
+    "ALI=F":    1.5,   # Aluminium
+    "CL=F":     1.5,   # Crude Oil — alert on 1.5%+ move
+    "^GSPC":    1.0,   # S&P 500
+    "QQQ":      1.0,   # Nasdaq
+    "GBPUSD=X": 0.4,   # GBP/USD  — forex moves less
+    "EURUSD=X": 0.4,   # EUR/USD
+    "BTC-USD":  3.0,   # Bitcoin  — volatile, needs bigger threshold
+    "ETH-USD":  3.0,   # Ethereum
+}
+
+def maybe_send_breakout_alerts(state: dict):
+    """Fire alerts when price breaks above resistance or below support.
+
+    Catches moves that don't have an associated news headline — pure technical
+    breakouts. Uses 15-min S/R levels as the breakout boundary. Each level can
+    only fire once per direction per cooldown window so we don't spam if price
+    chops back and forth across the level.
+    """
+    last_breakouts = state.get("__last_breakouts__", {})
+    alerts         = []
+    weekend        = is_weekend()
+    now            = now_utc().isoformat()
+    cooldown_min   = 60  # don't re-fire the same break within 60 min
+
+    for sym, data in _price_cache.items():
+        if sym not in ASSET_MAP:
+            continue
+        if weekend and sym not in CRYPTO_SYMBOLS:
+            continue
+
+        price = data.get("price")
+        s15   = data.get("support")
+        r15   = data.get("resistance")
+        if not price or price <= 0:
+            continue
+
+        # Vol confirmation — a breakout without volume is almost always a fakeout
+        vol = data.get("vol_ratio") or 0
+        if vol < 1.3:
+            continue
+
+        last = last_breakouts.get(sym, {})
+
+        if r15 and price > r15:
+            last_up_str = last.get("up")
+            recent = False
+            if last_up_str:
+                try:
+                    recent = (now_utc() - datetime.fromisoformat(last_up_str)) < timedelta(minutes=cooldown_min)
+                except Exception:
+                    recent = False
+            if not recent:
+                alerts.append((sym, "up", price, r15, vol))
+                last["up"] = now
+
+        if s15 and price < s15:
+            last_dn_str = last.get("down")
+            recent = False
+            if last_dn_str:
+                try:
+                    recent = (now_utc() - datetime.fromisoformat(last_dn_str)) < timedelta(minutes=cooldown_min)
+                except Exception:
+                    recent = False
+            if not recent:
+                alerts.append((sym, "down", price, s15, vol))
+                last["down"] = now
+
+        if last:
+            last_breakouts[sym] = last
+
+    if alerts:
+        lines = ["🚨 *Technical Breakout Alert*\n"]
+        for sym, direction, price, level, vol in alerts:
+            arrow  = "🟢 ↑" if direction == "up" else "🔴 ↓"
+            label_ = "ABOVE resistance" if direction == "up" else "BELOW support"
+            prefix = "$" if sym not in FOREX_SYMBOLS else ""
+            lines.append(
+                f"{arrow} *{friendly(sym)}* broke {label_} ({prefix}{level})\n"
+                f"   Now: {prefix}{price} | Volume: {vol:.1f}x avg"
+            )
+        lines.append("\n_Pure technical break — no news catalyst required. Volume confirms._")
+        send_telegram("\n".join(lines))
+
+    state["__last_breakouts__"] = last_breakouts
+
+def maybe_send_event_warnings(state: dict, calendar_events: list):
+    """Send a heads-up 30 min before each high-impact economic event.
+
+    Lets the user de-risk positions before scheduled volatility (CPI, NFP, FOMC).
+    Each event is only warned about once per day — tracked by a date+title key.
+    """
+    if not calendar_events:
+        return
+
+    now            = now_utc()
+    today_key      = now.strftime("%Y-%m-%d")
+    sent           = state.get("__event_warnings_sent__", {})
+    sent_today     = sent.get(today_key, [])
+    new_warnings   = []
+
+    for event in calendar_events:
+        time_str = event.get("time", "").replace(" UTC", "").strip()
+        title    = event.get("title", "")
+        currency = event.get("currency", "")
+        if not time_str or not title:
+            continue
+        try:
+            hh, mm    = time_str.split(":")
+            event_dt  = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        except Exception:
+            continue
+
+        minutes_until = (event_dt - now).total_seconds() / 60
+        # Fire once when event is 20-35 min out
+        if 20 <= minutes_until <= 35:
+            event_key = f"{title}|{currency}|{time_str}"
+            if event_key in sent_today:
+                continue
+            sent_today.append(event_key)
+            new_warnings.append((title, currency, time_str, int(minutes_until)))
+
+    if new_warnings:
+        lines = ["⏰ *High-Impact Event Warning*\n"]
+        for title, currency, time_str, mins in new_warnings:
+            lines.append(f"⚡ *{title}* ({currency}) at {time_str} UTC — in ~{mins} min")
+        lines.append("\n_Expect volatility and possible whipsaws. Tighten stops or stay flat._")
+        send_telegram("\n".join(lines))
+
+    sent[today_key] = sent_today
+    # Garbage-collect old date keys (keep only today + yesterday)
+    yesterday_key = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    state["__event_warnings_sent__"] = {
+        k: v for k, v in sent.items() if k in (today_key, yesterday_key)
+    }
+
+def maybe_send_price_alerts(state: dict):
+    """Fire a Telegram alert if any asset moved significantly since the last run."""
+    last_prices = state.get("__last_prices__", {})
+    alerts      = []
+    weekend     = is_weekend()
+
+    for sym, data in _price_cache.items():
+        if sym not in ASSET_MAP:
+            continue
+        if weekend and sym not in CRYPTO_SYMBOLS:
+            continue
+
+        current = data.get("price")
+        if not current:
+            continue
+
+        threshold = PRICE_ALERT_THRESHOLDS.get(sym, 1.5)
+        last      = last_prices.get(sym)
+
+        if last and last > 0:
+            pct_change = abs((current - last) / last * 100)
+            if pct_change >= threshold:
+                direction = "📈" if current > last else "📉"
+                signed    = (current - last) / last * 100
+                alerts.append((sym, signed, pct_change, current, direction))
+
+    if alerts:
+        # Sort by magnitude — biggest move first
+        alerts.sort(key=lambda x: x[2], reverse=True)
+        lines = ["⚡ *Price Movement Alert*\n"]
+        for sym, signed, pct, price, direction in alerts:
+            prefix = "$" if sym not in FOREX_SYMBOLS else ""
+            lines.append(
+                f"{direction} *{friendly(sym)}*: {signed:+.2f}% "
+                f"| {prefix}{price}"
+            )
+        lines.append(
+            f"\n_Prices moved since last bot run — check the chart for context._"
+        )
+        send_telegram("\n".join(lines))
+
+    # Always save current prices for next run comparison
+    state["__last_prices__"] = {
+        sym: data["price"]
+        for sym, data in _price_cache.items()
+        if sym in ASSET_MAP and data.get("price")
+    }
+
+# ─────────────────────────────
+# MAIN
+# ─────────────────────────────
+def main():
+    print(f"[{now_utc().strftime('%H:%M:%S UTC')}] Bot starting...")
+
+    weekend = is_weekend()
+
+    if weekend:
+        print("Weekend mode — running crypto signals only.")
+        active_feeds = WEEKEND_FEEDS
+    elif not is_market_open():
+        print("Market closed — nothing to do.")
+        return
+    else:
+        active_feeds = ALL_FEEDS
+
+    state = load_state()
+
+    maybe_send_weekly_summary(state)
+
+    calendar_events = fetch_calendar() if not weekend else []
+
+    maybe_send_heartbeat(state, calendar_events)
+
+    print("Fetching intraday prices + daily context...")
+    refresh_price_cache()
+
+    # ── PRE-EVENT WARNINGS ───────────────────────────────────────────────
+    maybe_send_event_warnings(state, calendar_events)
+
+    # ── PRICE MOVEMENT ALERTS ────────────────────────────────────────────
+    maybe_send_price_alerts(state)
+
+    # ── TECHNICAL BREAKOUT ALERTS (no news required) ─────────────────────
+    maybe_send_breakout_alerts(state)
+
+    # ── PRE-SCAN: count how many outlets report each story ──────────────
+    print("Pre-scanning feeds for multi-source stories...")
+    all_entries: list  = []
+    story_counts: dict = {}
+
+    for url, signal_type in active_feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "").strip()
+                if not title:
+                    continue
+                all_entries.append((title, entry, signal_type))
+                key     = title.lower()[:150]
+                matched = False
+                for existing_key in list(story_counts.keys()):
+                    if SequenceMatcher(None, key, existing_key).ratio() >= 0.70:
+                        story_counts[existing_key] += 1
+                        matched = True
+                        break
+                if not matched:
+                    story_counts[key] = 1
+        except Exception as e:
+            print(f"  Pre-scan error ({url[:55]}): {e}")
+
+    # ── PROCESS ENTRIES ──────────────────────────────────────────────────
+    seen_headlines = state["seen_headlines"]
+    cooldowns      = state["__cooldowns__"]
+    weekly_signals = state["__weekly_signals__"]
+
+    signals_sent = 0
+
+    for title, entry, signal_type in all_entries:
+        try:
+            if title in seen_headlines:
+                continue
+
+            if is_duplicate(title, seen_headlines):
+                print(f"  Duplicate skipped: {title[:60]}")
+                seen_headlines.append(title)
+                continue
+
+            seen_headlines.append(title)
+
+            if not is_fresh(entry):
+                continue
+
+            if not is_important(title):
+                continue
+
+            moves        = get_cached_moves(title)
+            src_count    = count_sources(title, story_counts)
+            sc, reaction = score_signal(title, moves, signal_type, src_count)
+
+            # Sentiment pre-filter — adds a small score nudge for clearly
+            # directional language. Doesn't reject anything by itself, just
+            # helps directional headlines clear the threshold faster.
+            sent_score, sent_label = score_headline_sentiment(title)
+            if sent_label == "bullish" or sent_label == "bearish":
+                sc = min(100, sc + 5)
+
+            print(f"  Score {sc:>3} | src:{src_count} | sent:{sent_label} | {signal_type} | {title[:55]}")
+
+            if sc < SCORE_THRESHOLD:
+                continue
+
+            primary_symbol = get_primary_symbol(title, moves)
+
+            if cooldown_active(primary_symbol, cooldowns):
+                print(f"  Cooldown active for {primary_symbol}, skipping.")
+                continue
+
+            ai_text    = analyze(title, reaction, moves, signal_type, calendar_events, primary_symbol)
+            ai_parsed  = parse_ai(ai_text)
+            ai_impact  = parse_impact(ai_parsed.get("IMPACT", "5"))
+            if ai_impact <= 2:
+                print(f"  AI impact too low ({ai_impact}/10), skipping signal.")
+                continue
+
+            # Key-level trap check — block BUYs right at resistance and SELLs
+            # right at support. These are the classic retail trap setups where
+            # odds favour rejection rather than continuation.
+            ai_bias      = sanitize(ai_parsed.get("BIAS", "")).strip().upper()
+            primary_data = moves.get(primary_symbol, {})
+            is_trap, trap_reason = is_at_trap_level(ai_bias, primary_data)
+            if is_trap:
+                print(f"  {trap_reason}")
+                continue
+
+            msg     = format_msg(
+                title, reaction, sc, moves,
+                primary_symbol, ai_text, signal_type, calendar_events,
+                state, src_count,
+            )
+
+            if send_telegram(msg):
+                signals_sent += 1
+                cooldowns[primary_symbol] = now_utc().isoformat()
+                if signals_sent >= MAX_SIGNALS_PER_RUN:
+                    print(f"  Signal cap ({MAX_SIGNALS_PER_RUN}) reached — stopping this run.")
+                    break
+
+                bias_clean = sanitize(ai_parsed.get("BIAS", "NEUTRAL")).strip()
+
+                update_streak(state, primary_symbol, bias_clean)
+
+                weekly_signals.append({
+                    "ts":       now_utc().isoformat(),
+                    "headline": title[:80],
+                    "bias":     bias_clean,
+                    "score":    sc,
+                    "symbol":   friendly(primary_symbol),
+                })
+
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"  Entry error ({title[:50]}): {e}")
+
+    state["seen_headlines"]     = seen_headlines
+    state["__cooldowns__"]      = cooldowns
+    state["__weekly_signals__"] = weekly_signals
+    save_state(state)
+
+    print(f"Done. Signals sent: {signals_sent}")
+
+
+if __name__ == "__main__":
+    main()
