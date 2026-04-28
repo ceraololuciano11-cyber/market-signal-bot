@@ -2,6 +2,8 @@ name: Market Signal Bot
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
 
 concurrency:
   group: market-signal-bot
