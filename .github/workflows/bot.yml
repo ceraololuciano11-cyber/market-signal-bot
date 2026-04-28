@@ -1,0 +1,38 @@
+name: Market Signal Bot
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: market-signal-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Restore seen headlines cache
+        uses: actions/cache@v4
+        with:
+          path: seen_headlines.json
+          key: seen-${{ github.run_number }}
+          restore-keys: seen-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_KEY }}
+        run: python market_signal_bot.py
