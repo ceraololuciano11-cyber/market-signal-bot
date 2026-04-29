@@ -1,6 +1,6 @@
 """
 Market Signal Bot — MAX Edition
-Runs once per invocation via GitHub Actions (every 5 min).
+Runs once per invocation via GitHub Actions (every 10 min).
 Keys are read from environment variables — set them as GitHub Secrets.
 
 Upgrades:
@@ -453,7 +453,7 @@ def signal_confidence(data: dict, bias: str):
             score += 1
 
     vol = data.get("vol_ratio")
-    if vol is not None:
+    if vol is not None and bias in ("BUY", "SELL"):
         total += 1
         if vol >= 1.5:
             score += 1
@@ -1047,78 +1047,135 @@ def label(s: int) -> str:
 # ─────────────────────────────
 # AI ANALYSIS
 # ─────────────────────────────
+def _build_tech_block(d: dict, label: str) -> str:
+    """Format a full technical data block for one timeframe."""
+    lines = [f"{label}:"]
+    if d.get("rsi") is not None:
+        lines.append(f"  RSI(14):    {rsi_label(d['rsi'])}")
+    if d.get("macd") is not None and d.get("macd_signal") is not None:
+        lines.append(f"  MACD:       {macd_label(d['macd'], d['macd_signal'])}")
+    if d.get("trend"):
+        lines.append(f"  Trend:      {d['trend']}")
+    if d.get("ema20"):
+        lines.append(f"  EMA20:      {d['ema20']}")
+    if d.get("ema50"):
+        lines.append(f"  EMA50:      {d['ema50']}")
+    if d.get("vol_ratio") is not None:
+        lines.append(f"  Volume:     {volume_label(d['vol_ratio'])}")
+    if d.get("support") is not None:
+        lines.append(f"  Support:    {d['support']}")
+    if d.get("resistance") is not None:
+        lines.append(f"  Resistance: {d['resistance']}")
+    if d.get("atr") is not None:
+        lines.append(f"  ATR(14):    {d['atr']}")
+    if d.get("divergence"):
+        lines.append(f"  Divergence: {d['divergence'].upper()} RSI divergence detected")
+    return "\n".join(lines)
+
 def analyze(title: str, reaction: str, moves: dict, signal_type: str,
             calendar_events: list, primary_symbol: str = "") -> str:
 
-    if moves:
-        rows = []
-        for s, d in moves.items():
-            if s not in ASSET_MAP:
-                continue
-            row = (
-                f"  {friendly(s)}: {d['move']:+.2f}% today | price: {d['price']}"
-                f" | RSI(14): {rsi_label(d.get('rsi'))}"
-                f" | Trend: {d.get('trend', 'n/a')}"
-            )
-            if d.get("ema20"):
-                row += f" | EMA20: {d['ema20']}"
-            if d.get("ema50"):
-                row += f" | EMA50: {d['ema50']}"
-            rows.append(row)
-        prices_str = "\n".join(rows) if rows else "  prices unavailable"
-    else:
-        prices_str = "  prices unavailable"
+    # ── Build rich technical context for primary instrument ──────────────────
+    primary_data = moves.get(primary_symbol, {})
 
-    if calendar_events:
-        cal_str = ", ".join([f"{e['title']} ({e['currency']})" for e in calendar_events[:4]])
-    else:
-        cal_str = "none"
+    tech_15m = _build_tech_block(primary_data, "15-minute chart") if primary_data else ""
 
-    macro_note  = "This is a macro event — consider all instruments." if is_macro(title) else ""
-    crypto_note = "This is a crypto headline — focus on Bitcoin (BTC/USD) and Ethereum (ETH/USD)." if is_crypto_headline(title) else ""
+    hourly_data = {
+        "rsi":   primary_data.get("hourly_rsi"),
+        "trend": primary_data.get("hourly_trend"),
+    }
+    tech_1h = _build_tech_block(hourly_data, "1-hour chart") if any(hourly_data.values()) else ""
 
-    # Inject market fear context into prompt
+    daily_data = {
+        "rsi":        primary_data.get("daily_rsi"),
+        "trend":      primary_data.get("daily_trend"),
+        "support":    primary_data.get("daily_support"),
+        "resistance": primary_data.get("daily_resistance"),
+    }
+    tech_daily = _build_tech_block(daily_data, "Daily chart") if any(daily_data.values()) else ""
+
+    tech_block = "\n\n".join(filter(None, [tech_15m, tech_1h, tech_daily]))
+    if not tech_block:
+        tech_block = "  Technical data unavailable"
+
+    # ── Other instrument moves (context) ────────────────────────────────────
+    other_rows = []
+    for s, d in moves.items():
+        if s == primary_symbol or s not in ASSET_MAP:
+            continue
+        other_rows.append(f"  {friendly(s)}: {d['move']:+.2f}% | price: {d['price']}")
+    other_str = "\n".join(other_rows) if other_rows else "  n/a"
+
+    # ── Calendar ─────────────────────────────────────────────────────────────
+    cal_str = ", ".join([f"{e['title']} ({e['currency']})" for e in calendar_events[:4]]) if calendar_events else "none"
+
+    # ── Market fear context ───────────────────────────────────────────────────
     vix_d = _price_cache.get("^VIX")
     if vix_d and primary_symbol not in CRYPTO_SYMBOLS:
-        vix_context = f"Market fear gauge — VIX: {vix_d.get('price', 'n/a')} ({vix_label(vix_d.get('price', 0)) if vix_d.get('price') else 'n/a'})"
+        fear_str = f"VIX: {vix_d.get('price', 'n/a')} — {vix_label(vix_d.get('price', 0)) if vix_d.get('price') else 'n/a'}"
     elif primary_symbol in CRYPTO_SYMBOLS:
         fg = fetch_fear_greed()
-        vix_context = f"Crypto Fear & Greed: {fg['value']} — {fg['label']}" if fg else ""
+        fear_str = f"Crypto Fear & Greed: {fg['value']} — {fg['label']}" if fg else "n/a"
     else:
-        vix_context = ""
+        fear_str = "n/a"
 
-    prompt = f"""You are a professional macro and crypto trading analyst.
+    # ── DXY context ──────────────────────────────────────────────────────────
+    dxy_d = _price_cache.get("DX-Y.NYB")
+    dxy_str = f"DXY: {dxy_d['price']} ({dxy_d['move']:+.2f}% today) | {dxy_d.get('trend','n/a')}" if dxy_d else "n/a"
 
-Headline: {title}
-Signal type: {signal_type}
-Market reaction so far: {reaction}
-Today's high-impact scheduled events: {cal_str}
-{vix_context}
+    macro_note  = "This is a macro event affecting all instruments." if is_macro(title) else ""
+    crypto_note = "This is a crypto headline — focus on Bitcoin (BTC/USD) and Ethereum (ETH/USD)." if is_crypto_headline(title) else ""
+
+    prim_name = friendly(primary_symbol) if primary_symbol else "the most affected asset"
+    prim_price = primary_data.get("price", "n/a")
+    prim_move  = f"{primary_data['move']:+.2f}%" if primary_data.get("move") is not None else "n/a"
+
+    prompt = f"""You are a senior institutional trading analyst with deep expertise in macro, technical analysis, and risk management.
+
+━━━ HEADLINE ━━━
+{title}
+Signal type: {signal_type} | Market reaction so far: {reaction}
+
+━━━ PRIMARY INSTRUMENT ━━━
+{prim_name} | Price: {prim_price} | Today: {prim_move}
+
+{tech_block}
+
+━━━ MACRO CONTEXT ━━━
+Market fear: {fear_str}
+Dollar Index: {dxy_str}
+High-impact events today: {cal_str}
 {macro_note}{crypto_note}
 
-Live market data (today's intraday move + current price):
-{prices_str}
+━━━ OTHER INSTRUMENTS (context) ━━━
+{other_str}
 
-My watchlist: Gold (XAU/USD), Aluminium (ALI/USD), Crude Oil (WTI), S&P 500, US Tech 100 (Nasdaq), GBP/USD, EUR/USD, Bitcoin (BTC/USD), Ethereum (ETH/USD)
+━━━ YOUR TASK ━━━
+Analyze this headline for {prim_name}. Consider:
+1. What does this news fundamentally mean for this asset?
+2. Do the technicals (RSI, MACD, trend, divergence, multi-timeframe) CONFIRM or CONTRADICT the news bias?
+3. Is the risk/reward worth taking given current S/R levels?
+4. What is the single biggest risk to this trade?
 
-IMPORTANT: Always use full plain-English names. Never use ticker codes like QQQ, SPX, CL, GC, DXY, NQ, ES, BTC, ETH — write "US Tech 100 (Nasdaq)", "S&P 500", "Crude Oil (WTI)", "Gold (XAU/USD)", "Bitcoin (BTC/USD)", "Ethereum (ETH/USD)" etc.
-
-The PRIMARY instrument for this signal is: {friendly(primary_symbol) if primary_symbol else "the most affected asset"}
+RULES:
+- Always use full plain-English names. NEVER use tickers (QQQ, SPX, GC, CL, BTC, ETH, DXY, NQ etc.)
+- ENTRY, STOP, TARGET are for {prim_name} ONLY — numbers only, no words
+- REASON must cover: (1) news catalyst impact, (2) technical confirmation or warning, (3) exact trade logic
 
 Return EXACTLY this format, no extra text:
 BIAS: BUY / SELL / NEUTRAL
-IMPACT: [1-10 integer — how market-moving is this news]
-AFFECTS: [full plain-English names of affected instruments, no tickers]
-REASON: [2-3 direct sentences explaining the trade logic in plain English]
-ENTRY: [price level or range for {friendly(primary_symbol) if primary_symbol else "primary instrument"} ONLY — numbers only, e.g. 1.3520 or 1.3520-1.3540, no other assets]
-STOP: [stop loss for {friendly(primary_symbol) if primary_symbol else "primary instrument"} ONLY — single number]
-TARGET: [profit target for {friendly(primary_symbol) if primary_symbol else "primary instrument"} ONLY — single number or range]
-WATCH: [key level or upcoming catalyst in plain English]"""
+IMPACT: [1-10 — how market-moving is this news]
+AFFECTS: [full plain-English names of affected instruments]
+REASON: [3 sentences: catalyst impact + technical read + trade logic]
+ENTRY: [price or range for {prim_name} only — numbers only]
+STOP: [stop loss — single number]
+TARGET: [profit target — single number or range]
+WATCH: [the one thing that would invalidate this trade]"""
 
     try:
         res = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
+            model="claude-sonnet-4-6",
+            max_tokens=700,
             messages=[{"role": "user", "content": prompt}],
         )
         return res.content[0].text
@@ -1147,9 +1204,39 @@ def parse_ai(ai_text: str) -> dict:
 
 def parse_impact(raw: str) -> int:
     try:
-        return max(1, min(10, int("".join(c for c in raw if c.isdigit())[:2])))
+        m = re.search(r'\d+', raw)
+        return max(1, min(10, int(m.group()))) if m else 5
     except Exception:
         return 5
+
+def compute_rr(entry_str: str, stop_str: str, target_str: str, bias: str) -> str:
+    """Return a formatted R:R string like '1:2.4', or '' if inputs are invalid."""
+    try:
+        # Entry — handle range like "1990.0-2003.0"
+        parts = entry_str.split("-")
+        if len(parts) == 2:
+            entry = (float(parts[0]) + float(parts[1])) / 2
+        else:
+            entry = float(entry_str)
+
+        stop = float(stop_str)
+
+        # Target — use the conservative end (closest to entry)
+        tparts = target_str.split("-")
+        if len(tparts) == 2:
+            t1, t2 = float(tparts[0]), float(tparts[1])
+            target = min(t1, t2) if bias == "BUY" else max(t1, t2)
+        else:
+            target = float(target_str)
+
+        risk   = abs(entry - stop)
+        reward = abs(target - entry)
+        if risk <= 0:
+            return ""
+        rr = reward / risk
+        return f"1:{rr:.1f}"
+    except Exception:
+        return ""
 
 # ─────────────────────────────
 # TICKER REPLACER
@@ -1422,11 +1509,14 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         def _has_real_level(v: str) -> bool:
             return v.strip().lower() not in placeholders and bool(re.search(r'\d', v))
         has_levels = all(_has_real_level(v) for v in [entry, stop, target])
+    rr_str = compute_rr(entry, stop, target, bias) if has_levels and bias in ("BUY", "SELL") else ""
+    rr_display = f"  R:R Ratio: {rr_str}\n" if rr_str else ""
     levels_section = (
         f"📌 *Trade levels ({friendly(primary_symbol)}):*\n"
         f"  Entry:     {entry}\n"
         f"  Stop Loss: {stop}\n"
-        f"  Target:    {target}\n\n"
+        f"  Target:    {target}\n"
+        f"{rr_display}\n"
     ) if has_levels else ""
 
     # Calendar
