@@ -444,8 +444,16 @@ def signal_confidence(data: dict, bias: str):
         elif bias == "SELL" and "Downtrend" in hourly:
             score += 1
 
+    fourh = data.get("4h_trend", "")
+    if fourh and fourh != "n/a" and bias in ("BUY", "SELL"):
+        total += 1
+        if bias == "BUY" and "Uptrend" in fourh:
+            score += 1
+        elif bias == "SELL" and "Downtrend" in fourh:
+            score += 1
+
     daily = data.get("daily_trend", "")
-    if daily and daily != "n/a":
+    if daily and daily != "n/a" and bias in ("BUY", "SELL"):
         total += 1
         if bias == "BUY" and "Uptrend" in daily:
             score += 1
@@ -570,10 +578,21 @@ def fetch_symbol_data(symbol: str):
         meta   = result.get("meta", {})
         quote  = result["indicators"]["quote"][0]
 
-        closes  = [c for c in quote.get("close",  []) if c is not None]
-        highs   = [h for h in quote.get("high",   []) if h is not None]
-        lows    = [lo for lo in quote.get("low",  []) if lo is not None]
-        volumes = [v for v in quote.get("volume", []) if v is not None and v > 0]
+        # Zip all OHLCV so lists stay aligned (a bar missing any value is dropped)
+        rows = [
+            (o, h, lo, c, v)
+            for o, h, lo, c, v in zip(
+                quote.get("open",   []),
+                quote.get("high",   []),
+                quote.get("low",    []),
+                quote.get("close",  []),
+                quote.get("volume", []),
+            )
+            if None not in (o, h, lo, c) and v is not None and v > 0
+        ]
+        if not rows:
+            return None
+        opens, highs, lows, closes, volumes = map(list, zip(*rows))
 
         if not closes:
             return None
@@ -606,22 +625,34 @@ def fetch_symbol_data(symbol: str):
         # before price actually reverses.
         divergence = detect_divergence(closes)
         atr        = calculate_atr(highs, lows, closes)
+        fib        = detect_fibonacci(highs, lows, closes)
+        ob         = detect_order_blocks(opens, highs, lows, closes)
+        vwap       = calculate_vwap(highs, lows, closes, volumes)
+        mkt_str    = detect_market_structure(highs, lows, closes)
+        candle     = detect_candle_pattern(opens, highs, lows, closes)
+        liq_sweep  = detect_liquidity_sweep(highs, lows, closes)
 
         return {
-            "move":        move,
-            "price":       round(current, 4),
-            "rsi":         rsi,
-            "ema20":       ema20,
-            "ema50":       ema50,
-            "trend":       trend,
-            "macd":        macd_val,
-            "macd_signal": macd_sig,
-            "macd_hist":   macd_hist,
-            "vol_ratio":   vol_ratio,
-            "support":     support,
-            "resistance":  resistance,
-            "divergence":  divergence,  # "bullish", "bearish", or ""
-            "atr":         atr,         # Average True Range (15m bars)
+            "move":             move,
+            "price":            round(current, 4),
+            "rsi":              rsi,
+            "ema20":            ema20,
+            "ema50":            ema50,
+            "trend":            trend,
+            "macd":             macd_val,
+            "macd_signal":      macd_sig,
+            "macd_hist":        macd_hist,
+            "vol_ratio":        vol_ratio,
+            "support":          support,
+            "resistance":       resistance,
+            "divergence":       divergence,
+            "atr":              atr,
+            "fib":              fib,
+            "ob":               ob,
+            "vwap":             vwap,
+            "market_structure": mkt_str,
+            "candle_pattern":   candle,
+            "liquidity_sweep":  liq_sweep,
         }
     except Exception as e:
         print(f"  Data fetch failed for {symbol}: {e}")
@@ -650,10 +681,12 @@ def fetch_daily_context(symbol: str) -> dict:
         d_support     = round(min(lows[-30:]),  4) if len(lows)  >= 2 else None
         d_resistance  = round(max(highs[-30:]), 4) if len(highs) >= 2 else None
         return {
-            "daily_trend":      d_trend,
-            "daily_rsi":        d_rsi,
-            "daily_support":    d_support,
-            "daily_resistance": d_resistance,
+            "daily_trend":            d_trend,
+            "daily_rsi":              d_rsi,
+            "daily_support":          d_support,
+            "daily_resistance":       d_resistance,
+            "daily_fib":              detect_fibonacci(highs, lows, closes),
+            "daily_market_structure": detect_market_structure(highs, lows, closes),
         }
     except Exception as e:
         print(f"  Daily context failed for {symbol}: {e}")
@@ -689,6 +722,113 @@ def fetch_hourly_context(symbol: str) -> dict:
         }
     except Exception as e:
         print(f"  Hourly context failed for {symbol}: {e}")
+        return {}
+
+def fetch_5m_context(symbol: str) -> dict:
+    """Return 5-minute timeframe data: RSI, trend, S/R, FVG, Fib, and Order Blocks."""
+    try:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?interval=5m&range=5d"
+        )
+        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+        result = r["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+        rows   = [
+            (o, h, lo, c)
+            for o, h, lo, c in zip(
+                quote.get("open",  []), quote.get("high",  []),
+                quote.get("low",   []), quote.get("close", []),
+            )
+            if None not in (o, h, lo, c)
+        ]
+        if len(rows) < 10:
+            return {}
+        opens, highs, lows, closes = map(list, zip(*rows))
+        current = closes[-1]
+        ema20   = calculate_ema(closes, 20)
+        ema50   = calculate_ema(closes, 50)
+        return {
+            "5m_rsi":              calculate_rsi(closes),
+            "5m_trend":            trend_label(current, ema20, ema50),
+            "5m_support":          round(min(lows[-30:]),  4) if len(lows)  >= 2 else None,
+            "5m_resistance":       round(max(highs[-30:]), 4) if len(highs) >= 2 else None,
+            "5m_fvg":              detect_fvg(highs, lows, closes),
+            "5m_fib":              detect_fibonacci(highs, lows, closes),
+            "5m_ob":               detect_order_blocks(opens, highs, lows, closes),
+            "5m_market_structure": detect_market_structure(highs, lows, closes),
+            "5m_candle_pattern":   detect_candle_pattern(opens, highs, lows, closes),
+            "5m_liquidity_sweep":  detect_liquidity_sweep(highs, lows, closes),
+        }
+    except Exception as e:
+        print(f"  5m context failed for {symbol}: {e}")
+        return {}
+
+def fetch_4h_context(symbol: str) -> dict:
+    """Return 4-hour timeframe data aggregated from 1h bars: RSI, trend, S/R, and FVG.
+
+    Yahoo Finance has no native 4h interval, so we fetch 1h data over 3 months
+    and group every 4 consecutive bars into one 4h bar.
+    """
+    try:
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?interval=60m&range=3mo"
+        )
+        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
+        result = r["chart"]["result"][0]
+        quote  = result["indicators"]["quote"][0]
+
+        # Zip all OHLC so lists stay aligned
+        rows = [
+            (o, h, lo, c)
+            for o, h, lo, c in zip(
+                quote.get("open",  []), quote.get("high",  []),
+                quote.get("low",   []), quote.get("close", []),
+            )
+            if None not in (o, h, lo, c)
+        ]
+        if len(rows) < 8:
+            return {}
+
+        h1_opens  = [r[0] for r in rows]
+        h1_highs  = [r[1] for r in rows]
+        h1_lows   = [r[2] for r in rows]
+        h1_closes = [r[3] for r in rows]
+
+        # Trim to multiple of 4 so grouping is clean
+        rem = len(h1_closes) % 4
+        if rem:
+            h1_opens  = h1_opens[rem:]
+            h1_highs  = h1_highs[rem:]
+            h1_lows   = h1_lows[rem:]
+            h1_closes = h1_closes[rem:]
+
+        n4     = len(h1_closes) // 4
+        opens  = [h1_opens[i*4]                 for i in range(n4)]  # open of first 1h bar
+        highs  = [max(h1_highs[i*4 : i*4+4])   for i in range(n4)]
+        lows   = [min(h1_lows[i*4  : i*4+4])   for i in range(n4)]
+        closes = [h1_closes[i*4+3]              for i in range(n4)]  # close of last 1h bar
+
+        if len(closes) < 10:
+            return {}
+
+        current = closes[-1]
+        ema20   = calculate_ema(closes, 20)
+        ema50   = calculate_ema(closes, 50)
+        return {
+            "4h_rsi":              calculate_rsi(closes),
+            "4h_trend":            trend_label(current, ema20, ema50),
+            "4h_support":          round(min(lows[-30:]),  4) if len(lows)  >= 2 else None,
+            "4h_resistance":       round(max(highs[-30:]), 4) if len(highs) >= 2 else None,
+            "4h_fvg":              detect_fvg(highs, lows, closes),
+            "4h_fib":              detect_fibonacci(highs, lows, closes),
+            "4h_ob":               detect_order_blocks(opens, highs, lows, closes),
+            "4h_market_structure": detect_market_structure(highs, lows, closes),
+            "4h_liquidity_sweep":  detect_liquidity_sweep(highs, lows, closes),
+        }
+    except Exception as e:
+        print(f"  4h context failed for {symbol}: {e}")
         return {}
 
 def detect_divergence(closes: list, period: int = 14, lookback: int = 20) -> str:
@@ -754,6 +894,446 @@ def detect_divergence(closes: list, period: int = 14, lookback: int = 20) -> str
 
     return ""
 
+def detect_fvg(highs: list, lows: list, closes: list, lookback: int = 60) -> dict:
+    """Detect the most recent unfilled Fair Value Gap (imbalance zone).
+
+    A FVG is a 3-candle pattern where price moved so fast it left a gap that
+    wasn't traded through — the market tends to return and "fill" it later.
+
+    Bullish FVG: candle[i-1].high < candle[i+1].low
+      → price surged up, left a gap below (potential support / pullback magnet)
+    Bearish FVG: candle[i-1].low > candle[i+1].high
+      → price crashed down, left a gap above (potential resistance / rally magnet)
+
+    Returns dict with type/low/high/status, or {} if none found.
+    Status values:
+      "open"   — price hasn't returned to the gap yet (most tradeable)
+      "inside" — price is currently inside the gap (filling in progress)
+      "filled" — price traded fully through the gap (skip)
+    """
+    n = len(closes)
+    if n < 3 or len(highs) < 3 or len(lows) < 3:
+        return {}
+
+    current = closes[-1]
+    limit   = max(1, n - lookback)
+
+    for i in range(n - 2, limit - 1, -1):
+        h_prev = highs[i - 1]
+        l_prev = lows[i - 1]
+        h_next = highs[i + 1]
+        l_next = lows[i + 1]
+
+        # Bullish FVG: gap between previous high and next candle's low
+        if l_next > h_prev:
+            gap_lo = round(h_prev, 6)
+            gap_hi = round(l_next, 6)
+            if gap_hi <= gap_lo:
+                continue
+            if current < gap_lo:
+                status = "filled"
+            elif current <= gap_hi:
+                status = "inside"
+            else:
+                status = "open"
+            if status != "filled":
+                return {"type": "bullish", "low": gap_lo, "high": gap_hi, "status": status}
+
+        # Bearish FVG: gap between next candle's high and previous low
+        elif h_next < l_prev:
+            gap_lo = round(h_next, 6)
+            gap_hi = round(l_prev, 6)
+            if gap_hi <= gap_lo:
+                continue
+            if current > gap_hi:
+                status = "filled"
+            elif current >= gap_lo:
+                status = "inside"
+            else:
+                status = "open"
+            if status != "filled":
+                return {"type": "bearish", "low": gap_lo, "high": gap_hi, "status": status}
+
+    return {}
+
+def fvg_label(fvg: dict) -> str:
+    """Human-readable FVG description for AI prompt and Telegram messages."""
+    if not fvg:
+        return ""
+    t = fvg["type"].capitalize()
+    notes = {
+        "open":   "unfilled — price likely drawn back",
+        "inside": "price currently inside gap (filling)",
+    }
+    note = notes.get(fvg["status"], fvg["status"])
+    return f"{t} imbalance {fvg['low']} – {fvg['high']} ({note})"
+
+def detect_fibonacci(highs: list, lows: list, closes: list, lookback: int = 100) -> dict:
+    """Detect Fibonacci retracement levels from the most recent significant swing.
+
+    Scans the last `lookback` bars for the highest high and lowest low.
+    Whichever extreme is more recent defines the impulse direction:
+      - High after low  → bullish impulse → retracement levels count DOWN from top
+      - Low after high  → bearish impulse → retracement levels count UP from bottom
+
+    Key levels returned: 0.236, 0.382, 0.5 (Equilibrium), 0.618, 0.786
+    Extension targets:   1.272, 1.618 (for TP projection)
+
+    Returns {} if data is insufficient or the swing is flat.
+    """
+    n = len(closes)
+    if n < 10 or len(highs) < 10 or len(lows) < 10:
+        return {}
+
+    window   = min(n, lookback)
+    h_w      = highs[-window:]
+    l_w      = lows[-window:]
+    sh_idx   = h_w.index(max(h_w))
+    sl_idx   = l_w.index(min(l_w))
+    sw_high  = max(h_w)
+    sw_low   = min(l_w)
+    diff     = sw_high - sw_low
+
+    if diff <= 0:
+        return {}
+
+    current = closes[-1]
+
+    if sh_idx > sl_idx:
+        # Bullish impulse: low formed first, then price ran up
+        # Retracement levels measured DOWN from swing high
+        direction = "bullish"
+        lvl = lambda pct: round(sw_high - diff * pct, 4)
+        ext = lambda pct: round(sw_low  - diff * pct, 4)
+    else:
+        # Bearish impulse: high formed first, then price fell
+        # Retracement levels measured UP from swing low
+        direction = "bearish"
+        lvl = lambda pct: round(sw_low  + diff * pct, 4)
+        ext = lambda pct: round(sw_high + diff * pct, 4)
+
+    levels = {
+        "0.236": lvl(0.236),
+        "0.382": lvl(0.382),
+        "0.5":   lvl(0.500),  # Equilibrium
+        "0.618": lvl(0.618),
+        "0.786": lvl(0.786),
+        "1.272": ext(0.272),  # extension target 1
+        "1.618": ext(0.618),  # extension target 2
+    }
+
+    # Nearest standard retracement level to current price
+    std_keys = ["0.236", "0.382", "0.5", "0.618", "0.786"]
+    nearest  = min(std_keys, key=lambda k: abs(levels[k] - current))
+
+    return {
+        "direction":     direction,
+        "swing_high":    round(sw_high, 4),
+        "swing_low":     round(sw_low,  4),
+        "equilibrium":   levels["0.5"],
+        "fib_0236":      levels["0.236"],
+        "fib_0382":      levels["0.382"],
+        "fib_0618":      levels["0.618"],
+        "fib_0786":      levels["0.786"],
+        "fib_1272":      levels["1.272"],
+        "fib_1618":      levels["1.618"],
+        "nearest_level": nearest,
+        "nearest_price": levels[nearest],
+        "proximity_pct": round(abs(levels[nearest] - current) / current * 100, 2),
+    }
+
+def detect_order_blocks(opens: list, highs: list, lows: list, closes: list,
+                        lookback: int = 60) -> dict:
+    """Detect the most recent active bullish and bearish order blocks.
+
+    An order block (OB) is the last opposing candle before a strong impulse move.
+    Institutions leave unfilled orders there — price tends to return and react.
+
+      Bullish OB: last bearish candle before a strong bullish impulse
+        → zone = body of that candle, acts as support on a pullback
+      Bearish OB: last bullish candle before a strong bearish impulse
+        → zone = body of that candle, acts as resistance on a rally
+
+    Status:
+      "active"  — price hasn't returned to the zone (cleanest setup)
+      "inside"  — price is retesting the zone right now (entry opportunity)
+      "mitigated" — price traded through the zone (OB consumed, skip)
+
+    Returns {"bullish": {...}, "bearish": {...}} with only active/inside blocks.
+    """
+    n = len(closes)
+    if n < 6 or len(opens) < 6:
+        return {}
+
+    ranges    = [highs[i] - lows[i] for i in range(n)]
+    avg_range = sum(ranges[max(0, n-30):]) / min(30, n)
+    if avg_range == 0:
+        return {}
+
+    current = closes[-1]
+    result  = {"bullish": None, "bearish": None}
+    end     = max(1, n - lookback)
+
+    for i in range(n - 2, end, -1):
+        if result["bullish"] and result["bearish"]:
+            break
+        if i + 1 >= n:
+            continue
+
+        # ── Bullish OB ────────────────────────────────────────────────────────
+        # Bearish candle[i] → bullish impulse at candle[i+1]
+        if (result["bullish"] is None
+                and closes[i] < opens[i]             # candle i is bearish
+                and closes[i+1] > opens[i+1]         # candle i+1 is bullish
+                and (highs[i+1] - lows[i+1]) >= avg_range * 1.2):  # impulse
+
+            ob_lo = min(opens[i], closes[i])
+            ob_hi = max(opens[i], closes[i])
+            if ob_hi > ob_lo and current > ob_lo:   # price still above OB
+                status = "inside" if current <= ob_hi else "active"
+                result["bullish"] = {
+                    "low": round(ob_lo, 6), "high": round(ob_hi, 6),
+                    "status": status,
+                }
+
+        # ── Bearish OB ────────────────────────────────────────────────────────
+        # Bullish candle[i] → bearish impulse at candle[i+1]
+        if (result["bearish"] is None
+                and closes[i] > opens[i]             # candle i is bullish
+                and closes[i+1] < opens[i+1]         # candle i+1 is bearish
+                and (highs[i+1] - lows[i+1]) >= avg_range * 1.2):  # impulse
+
+            ob_lo = min(opens[i], closes[i])
+            ob_hi = max(opens[i], closes[i])
+            if ob_hi > ob_lo and current < ob_hi:   # price still below OB
+                status = "inside" if current >= ob_lo else "active"
+                result["bearish"] = {
+                    "low": round(ob_lo, 6), "high": round(ob_hi, 6),
+                    "status": status,
+                }
+
+    return {k: v for k, v in result.items() if v is not None}
+
+def calculate_vwap(highs: list, lows: list, closes: list, volumes: list,
+                   session_bars: int = 40) -> dict:
+    """Calculate VWAP over the most recent session window.
+
+    VWAP = Σ(typical_price × volume) / Σ(volume)
+    Typical price = (high + low + close) / 3
+
+    Uses last `session_bars` bars as a session approximation (≈40 bars covers
+    a full US equities session on 15m, or several forex hours). Also returns
+    ±1σ and ±2σ bands so the AI can identify overextension.
+    """
+    n = min(len(closes), session_bars)
+    if n < 2:
+        return {}
+
+    cum_vol   = 0.0
+    cum_tpvol = 0.0
+    cum_tp2vol = 0.0
+
+    for h, l, c, v in zip(highs[-n:], lows[-n:], closes[-n:], volumes[-n:]):
+        if v <= 0:
+            continue
+        tp = (h + l + c) / 3.0
+        cum_vol   += v
+        cum_tpvol += tp * v
+        cum_tp2vol += tp * tp * v
+
+    if cum_vol == 0:
+        return {}
+
+    vwap     = cum_tpvol / cum_vol
+    variance = max(0.0, (cum_tp2vol / cum_vol) - vwap ** 2)
+    std      = variance ** 0.5
+
+    current = closes[-1]
+    if vwap > 0:
+        dist_pct = round((current - vwap) / vwap * 100, 2)
+        if dist_pct > 0:
+            position = f"above VWAP (+{dist_pct}%)"
+        elif dist_pct < 0:
+            position = f"below VWAP ({dist_pct}%)"
+        else:
+            position = "at VWAP"
+    else:
+        position = "n/a"
+
+    return {
+        "vwap":      round(vwap, 4),
+        "vwap_u1":   round(vwap + std,     4),
+        "vwap_l1":   round(vwap - std,     4),
+        "vwap_u2":   round(vwap + 2 * std, 4),
+        "vwap_l2":   round(vwap - 2 * std, 4),
+        "position":  position,  # human-readable: "above VWAP (+0.3%)"
+    }
+
+def detect_market_structure(highs: list, lows: list, closes: list,
+                            lookback: int = 60) -> dict:
+    """Detect market structure: trend bias, BOS, or CHoCH.
+
+    Scans recent swing highs/lows to classify the market:
+      HH + HL → Bullish structure
+      LH + LL → Bearish structure
+      Mixed   → Ranging
+
+    BOS  (Break of Structure): current price broke a prior swing in the
+         direction of the existing trend → trend continuation.
+    CHoCH (Change of Character): current price broke a prior swing AGAINST
+         the existing trend → potential reversal, high-probability setup.
+    """
+    n = len(closes)
+    if n < 10:
+        return {}
+
+    window = min(n, lookback)
+    h_w = highs[-window:]
+    l_w = lows[-window:]
+
+    swing_highs, swing_lows = [], []
+    for i in range(1, len(h_w) - 1):
+        if h_w[i] > h_w[i - 1] and h_w[i] > h_w[i + 1]:
+            swing_highs.append(h_w[i])
+        if l_w[i] < l_w[i - 1] and l_w[i] < l_w[i + 1]:
+            swing_lows.append(l_w[i])
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return {}
+
+    sh1, sh2 = swing_highs[-1], swing_highs[-2]
+    sl1, sl2 = swing_lows[-1],  swing_lows[-2]
+
+    if sh1 > sh2 and sl1 > sl2:
+        structure, bias = "Bullish (HH + HL)", "bullish"
+    elif sh1 < sh2 and sl1 < sl2:
+        structure, bias = "Bearish (LH + LL)", "bearish"
+    elif sh1 > sh2:
+        structure, bias = "Ranging (HH + LL — expanding)", "neutral"
+    else:
+        structure, bias = "Ranging (LH + HL — contracting)", "neutral"
+
+    current = closes[-1]
+    event = ""
+    if current > sh1:
+        event = "BOS Bullish (trend continuation)" if bias == "bullish" \
+                else "CHoCH Bullish ⚡ (reversal signal — structure flipped)"
+    elif current < sl1:
+        event = "BOS Bearish (trend continuation)" if bias == "bearish" \
+                else "CHoCH Bearish ⚡ (reversal signal — structure flipped)"
+
+    return {
+        "structure":  structure,
+        "bias":       bias,
+        "swing_high": round(sh1, 4),
+        "swing_low":  round(sl1, 4),
+        "event":      event,
+    }
+
+def detect_candle_pattern(opens: list, highs: list, lows: list,
+                          closes: list) -> str:
+    """Detect the most recent significant candlestick pattern.
+
+    Checks the last 2 candles for:
+      Pin Bar     — long wick rejection (hammer / shooting star)
+      Engulfing   — body fully engulfs prior candle (continuation or reversal)
+      Doji        — tiny body, indecision / exhaustion
+    Returns a plain-English description, or "" if no pattern.
+    """
+    if len(closes) < 2 or len(opens) < 2:
+        return ""
+    o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
+    po, _ph, _pl, pc = opens[-2], highs[-2], lows[-2], closes[-2]
+
+    total   = h - l
+    if total <= 0:
+        return ""
+    body    = abs(c - o)
+    body_hi = max(o, c)
+    body_lo = min(o, c)
+    upper   = h - body_hi
+    lower   = body_lo - l
+
+    # Pin bars first — a hammer/shooting star naturally has a tiny body, so
+    # checking Doji first would misclassify them. Specific beats generic.
+    # Bullish pin bar (hammer): lower wick ≥ 2× body, lower wick ≥ 2× upper wick
+    if lower >= body * 2.0 and lower >= upper * 2.0 and lower >= total * 0.5:
+        return "Bullish Pin Bar (hammer) — strong rejection of lows, potential reversal up"
+
+    # Bearish pin bar (shooting star): upper wick ≥ 2× body, upper wick ≥ 2× lower wick
+    if upper >= body * 2.0 and upper >= lower * 2.0 and upper >= total * 0.5:
+        return "Bearish Pin Bar (shooting star) — strong rejection of highs, potential reversal down"
+
+    # Doji — body is < 10% of range (only after ruling out pin bars above)
+    if body / total < 0.10:
+        return "Doji — indecision / possible exhaustion"
+
+    # Engulfing — current body fully engulfs prior body
+    prev_body = abs(pc - po)
+    if prev_body > 0 and body > prev_body and body_lo <= min(po, pc) and body_hi >= max(po, pc):
+        if c > o and pc > po:
+            return "Bullish Engulfing — buyers overwhelmed prior sellers"
+        if c < o and pc < po:
+            return "Bearish Engulfing — sellers overwhelmed prior buyers"
+
+    return ""
+
+def detect_liquidity_sweep(highs: list, lows: list, closes: list,
+                           lookback: int = 30) -> str:
+    """Detect a recent liquidity sweep (stop hunt) on the last closed candle.
+
+    A sweep occurs when price briefly exceeds a prior key level (triggering
+    stop-losses) but then closes back inside — signalling a reversal.
+
+    Bullish sweep: wicked below the recent swing low then closed above it
+      → sells were triggered, now buyers absorb → long setup
+    Bearish sweep: wicked above the recent swing high then closed below it
+      → buys were triggered, now sellers absorb → short setup
+    """
+    n = len(closes)
+    if n < lookback + 2:
+        return ""
+
+    prior_h = highs[-(lookback + 1):-1]
+    prior_l = lows[-(lookback + 1):-1]
+    if not prior_h or not prior_l:
+        return ""
+
+    sw_high = max(prior_h)
+    sw_low  = min(prior_l)
+
+    last_h, last_l, last_c = highs[-1], lows[-1], closes[-1]
+
+    if last_h > sw_high and last_c < sw_high:
+        return (f"Bearish sweep of highs at {round(sw_high, 4)} — "
+                f"buy-side liquidity grabbed, potential reversal down ⚡")
+
+    if last_l < sw_low and last_c > sw_low:
+        return (f"Bullish sweep of lows at {round(sw_low, 4)} — "
+                f"sell-side liquidity grabbed, potential reversal up ⚡")
+
+    return ""
+
+def premium_discount_label(price: float, fib: dict) -> str:
+    """Classify current price as Premium, Discount, or at Equilibrium.
+
+    Smart Money Concepts framework:
+      Above EQ (0.5 fib) = PREMIUM — institutions prefer to sell here
+      Below EQ (0.5 fib) = DISCOUNT — institutions prefer to buy here
+      Near EQ            = EQUILIBRIUM — decision zone, wait for confirmation
+    """
+    if not fib or not price:
+        return ""
+    eq = fib.get("equilibrium")
+    if not eq or eq <= 0:
+        return ""
+    pct = (price - eq) / eq * 100
+    if pct > 1.0:
+        return f"PREMIUM (+{pct:.2f}% above EQ {eq}) — SM sells, look for shorts"
+    if pct < -1.0:
+        return f"DISCOUNT ({pct:.2f}% below EQ {eq}) — SM buys, look for longs"
+    return f"EQUILIBRIUM ({pct:+.2f}% from EQ {eq}) — fair value zone, wait for confirmation"
+
 def fetch_fear_greed():
     """Fetch Crypto Fear & Greed Index from alternative.me (free, no key)."""
     global _fear_greed_cache
@@ -816,10 +1396,10 @@ def refresh_price_cache():
         data = fetch_symbol_data(symbol)
         if data is not None:
             if symbol in ASSET_MAP:
-                daily  = fetch_daily_context(symbol)
-                hourly = fetch_hourly_context(symbol)
-                data.update(daily)
-                data.update(hourly)
+                data.update(fetch_5m_context(symbol))
+                data.update(fetch_daily_context(symbol))
+                data.update(fetch_hourly_context(symbol))
+                data.update(fetch_4h_context(symbol))
             _price_cache[symbol] = data
         time.sleep(0.5)
 
@@ -1070,6 +1650,54 @@ def _build_tech_block(d: dict, label: str) -> str:
         lines.append(f"  ATR(14):    {d['atr']}")
     if d.get("divergence"):
         lines.append(f"  Divergence: {d['divergence'].upper()} RSI divergence detected")
+    fvg = d.get("fvg") or {}
+    if fvg:
+        lines.append(f"  FVG:        {fvg_label(fvg)}")
+    fib = d.get("fib") or {}
+    if fib:
+        prox = fib.get("proximity_pct", 99)
+        note = f" ← price within {prox}% (AT KEY LEVEL)" if prox < 0.5 else ""
+        lines.append(
+            f"  Fib ({fib['direction']}): EQ={fib['equilibrium']} | "
+            f"0.382={fib['fib_0382']} | 0.618={fib['fib_0618']}{note}"
+        )
+        lines.append(
+            f"  Nearest fib:  {fib['nearest_level']} @ {fib['nearest_price']} "
+            f"({prox}% away)"
+        )
+        lines.append(
+            f"  Fib targets:  1.272={fib['fib_1272']} | 1.618={fib['fib_1618']}"
+        )
+    ob = d.get("ob") or {}
+    if ob.get("bullish"):
+        b = ob["bullish"]
+        lines.append(f"  Bull OB:    {b['low']} – {b['high']} ({b['status']})")
+    if ob.get("bearish"):
+        br = ob["bearish"]
+        lines.append(f"  Bear OB:    {br['low']} – {br['high']} ({br['status']})")
+    vwap_d = d.get("vwap") or {}
+    if vwap_d:
+        lines.append(f"  VWAP:       {vwap_d.get('vwap')} ({vwap_d.get('position', '')})")
+        if vwap_d.get("vwap_u1"):
+            lines.append(
+                f"  VWAP bands: +1σ={vwap_d['vwap_u1']} / -1σ={vwap_d['vwap_l1']} | "
+                f"+2σ={vwap_d['vwap_u2']} / -2σ={vwap_d['vwap_l2']}"
+            )
+    mkt_str = d.get("market_structure") or {}
+    if mkt_str:
+        lines.append(f"  Mkt Struct: {mkt_str.get('structure', '')}")
+        if mkt_str.get("event"):
+            lines.append(f"  Struct Evt: {mkt_str['event']}")
+    price = d.get("price")
+    fib_d = d.get("fib") or {}
+    if price and fib_d:
+        pd_lbl = premium_discount_label(price, fib_d)
+        if pd_lbl:
+            lines.append(f"  P/D Zone:   {pd_lbl}")
+    if d.get("candle_pattern"):
+        lines.append(f"  Candle:     {d['candle_pattern']}")
+    if d.get("liquidity_sweep"):
+        lines.append(f"  Liq Sweep:  {d['liquidity_sweep']}")
     return "\n".join(lines)
 
 def analyze(title: str, reaction: str, moves: dict, signal_type: str,
@@ -1080,21 +1708,55 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
 
     tech_15m = _build_tech_block(primary_data, "15-minute chart") if primary_data else ""
 
+    _price = primary_data.get("price")  # shared across timeframe sub-dicts for P/D zone
+
+    data_5m = {
+        "rsi":              primary_data.get("5m_rsi"),
+        "trend":            primary_data.get("5m_trend"),
+        "support":          primary_data.get("5m_support"),
+        "resistance":       primary_data.get("5m_resistance"),
+        "fvg":              primary_data.get("5m_fvg"),
+        "fib":              primary_data.get("5m_fib"),
+        "ob":               primary_data.get("5m_ob"),
+        "market_structure": primary_data.get("5m_market_structure"),
+        "candle_pattern":   primary_data.get("5m_candle_pattern"),
+        "liquidity_sweep":  primary_data.get("5m_liquidity_sweep"),
+        "price":            _price,
+    }
+    tech_5m = _build_tech_block(data_5m, "5-minute chart") if any(v for v in data_5m.values() if v) else ""
+
     hourly_data = {
         "rsi":   primary_data.get("hourly_rsi"),
         "trend": primary_data.get("hourly_trend"),
     }
     tech_1h = _build_tech_block(hourly_data, "1-hour chart") if any(hourly_data.values()) else ""
 
+    data_4h = {
+        "rsi":              primary_data.get("4h_rsi"),
+        "trend":            primary_data.get("4h_trend"),
+        "support":          primary_data.get("4h_support"),
+        "resistance":       primary_data.get("4h_resistance"),
+        "fvg":              primary_data.get("4h_fvg"),
+        "fib":              primary_data.get("4h_fib"),
+        "ob":               primary_data.get("4h_ob"),
+        "market_structure": primary_data.get("4h_market_structure"),
+        "liquidity_sweep":  primary_data.get("4h_liquidity_sweep"),
+        "price":            _price,
+    }
+    tech_4h = _build_tech_block(data_4h, "4-hour chart") if any(v for v in data_4h.values() if v) else ""
+
     daily_data = {
-        "rsi":        primary_data.get("daily_rsi"),
-        "trend":      primary_data.get("daily_trend"),
-        "support":    primary_data.get("daily_support"),
-        "resistance": primary_data.get("daily_resistance"),
+        "rsi":              primary_data.get("daily_rsi"),
+        "trend":            primary_data.get("daily_trend"),
+        "support":          primary_data.get("daily_support"),
+        "resistance":       primary_data.get("daily_resistance"),
+        "fib":              primary_data.get("daily_fib"),
+        "market_structure": primary_data.get("daily_market_structure"),
+        "price":            _price,
     }
     tech_daily = _build_tech_block(daily_data, "Daily chart") if any(daily_data.values()) else ""
 
-    tech_block = "\n\n".join(filter(None, [tech_15m, tech_1h, tech_daily]))
+    tech_block = "\n\n".join(filter(None, [tech_5m, tech_15m, tech_1h, tech_4h, tech_daily]))
     if not tech_block:
         tech_block = "  Technical data unavailable"
 
@@ -1525,7 +2187,46 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         cal_items   = " | ".join([f"{e['title']} ({e['currency']})" for e in calendar_events[:3]])
         cal_section = f"📅 *High-impact events today:* {cal_items}\n\n"
 
-    # Technical analysis — 15-min (intraday). primary_data already set above.
+    # ── 5m chart ─────────────────────────────────────────────────────────────
+    fivem_lines = []
+    if primary_data.get("5m_rsi") is not None:
+        fivem_lines.append(f"  RSI(14): {rsi_label(primary_data['5m_rsi'])}")
+    if primary_data.get("5m_trend"):
+        fivem_lines.append(f"  Trend:   {primary_data['5m_trend']}")
+    if primary_data.get("5m_support") is not None:
+        fivem_lines.append(f"  Support: {primary_data['5m_support']}")
+    if primary_data.get("5m_resistance") is not None:
+        fivem_lines.append(f"  Resist:  {primary_data['5m_resistance']}")
+    fvg_5m = primary_data.get("5m_fvg") or {}
+    if fvg_5m:
+        fvg_emoji = "🟢" if fvg_5m["type"] == "bullish" else "🔴"
+        fivem_lines.append(f"  FVG:     {fvg_emoji} {fvg_label(fvg_5m)}")
+    fib_5m = primary_data.get("5m_fib") or {}
+    if fib_5m:
+        fivem_lines.append(
+            f"  EQ(0.5): {fib_5m['equilibrium']} | "
+            f"0.618: {fib_5m['fib_0618']} | nearest: {fib_5m['nearest_level']} "
+            f"({fib_5m['proximity_pct']}% away)"
+        )
+    ob_5m = primary_data.get("5m_ob") or {}
+    if ob_5m.get("bullish"):
+        b = ob_5m["bullish"]
+        fivem_lines.append(f"  Bull OB: {b['low']} – {b['high']} ({b['status']})")
+    if ob_5m.get("bearish"):
+        br = ob_5m["bearish"]
+        fivem_lines.append(f"  Bear OB: {br['low']} – {br['high']} ({br['status']})")
+    ms_5m = primary_data.get("5m_market_structure") or {}
+    if ms_5m:
+        fivem_lines.append(f"  Struct:  {ms_5m.get('structure', '')}")
+        if ms_5m.get("event"):
+            fivem_lines.append(f"  ⚡ {ms_5m['event']}")
+    if primary_data.get("5m_candle_pattern"):
+        fivem_lines.append(f"  Candle:  {primary_data['5m_candle_pattern']}")
+    if primary_data.get("5m_liquidity_sweep"):
+        fivem_lines.append(f"  ⚡ {primary_data['5m_liquidity_sweep']}")
+    fivem_section = "🕐 *5-min chart:*\n" + "\n".join(fivem_lines) + "\n\n" if fivem_lines else ""
+
+    # ── 15m chart ────────────────────────────────────────────────────────────
     ta_lines = []
     if primary_data.get("rsi") is not None:
         ta_lines.append(f"  RSI(14):    {rsi_label(primary_data['rsi'])}")
@@ -1541,16 +2242,53 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     if divergence:
         emoji = "🟢" if divergence == "bullish" else "🔴"
         ta_lines.append(f"  Divergence: {emoji} {divergence.upper()} (RSI signaling possible reversal)")
+    fib_15 = primary_data.get("fib") or {}
+    if fib_15:
+        ta_lines.append(
+            f"  EQ(0.5):    {fib_15['equilibrium']} | "
+            f"0.382: {fib_15['fib_0382']} | 0.618: {fib_15['fib_0618']}"
+        )
+        ta_lines.append(
+            f"  Nearest fib: {fib_15['nearest_level']} @ {fib_15['nearest_price']} "
+            f"({fib_15['proximity_pct']}% away)"
+        )
+    ob_15 = primary_data.get("ob") or {}
+    if ob_15.get("bullish"):
+        b = ob_15["bullish"]
+        ta_lines.append(f"  Bull OB:    {b['low']} – {b['high']} ({b['status']})")
+    if ob_15.get("bearish"):
+        br = ob_15["bearish"]
+        ta_lines.append(f"  Bear OB:    {br['low']} – {br['high']} ({br['status']})")
+    vwap_d = primary_data.get("vwap") or {}
+    if vwap_d:
+        ta_lines.append(f"  VWAP:       {vwap_d.get('vwap')} ({vwap_d.get('position', '')})")
+        if vwap_d.get("vwap_u1"):
+            ta_lines.append(
+                f"  VWAP σ:     +1σ={vwap_d['vwap_u1']} / -1σ={vwap_d['vwap_l1']}"
+            )
+    ms_15 = primary_data.get("market_structure") or {}
+    if ms_15:
+        ta_lines.append(f"  Struct:     {ms_15.get('structure', '')}")
+        if ms_15.get("event"):
+            ta_lines.append(f"  ⚡ {ms_15['event']}")
+    price_15 = primary_data.get("price")
+    if price_15 and fib_15:
+        pd_15 = premium_discount_label(price_15, fib_15)
+        if pd_15:
+            ta_lines.append(f"  P/D Zone:   {pd_15}")
+    if primary_data.get("candle_pattern"):
+        ta_lines.append(f"  Candle:     {primary_data['candle_pattern']}")
+    if primary_data.get("liquidity_sweep"):
+        ta_lines.append(f"  ⚡ {primary_data['liquidity_sweep']}")
     ta_section = "📈 *Technical (15m):*\n" + "\n".join(ta_lines) + "\n\n" if ta_lines else ""
 
-    # Hourly trend — multi-timeframe confirmation
+    # ── 1h chart ─────────────────────────────────────────────────────────────
     hourly_section = ""
     h_trend = primary_data.get("hourly_trend", "")
     h_rsi   = primary_data.get("hourly_rsi")
     if h_trend or h_rsi is not None:
         h_lines = []
         if h_trend:
-            # Flag alignment / disagreement with 15m
             t15 = primary_data.get("trend", "")
             agree_marker = ""
             if "Uptrend" in t15 and "Uptrend" in h_trend:
@@ -1564,9 +2302,63 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         if h_rsi is not None:
             h_lines.append(f"  RSI(14): {rsi_label(h_rsi)}")
         if h_lines:
-            hourly_section = "⏱ *Hourly (1h) context:*\n" + "\n".join(h_lines) + "\n\n"
+            hourly_section = "⏱ *1h chart:*\n" + "\n".join(h_lines) + "\n\n"
 
-    # Daily context
+    # ── 4h chart ─────────────────────────────────────────────────────────────
+    fourh_section = ""
+    fh_trend = primary_data.get("4h_trend", "")
+    fh_rsi   = primary_data.get("4h_rsi")
+    if fh_trend or fh_rsi is not None:
+        fh_lines = []
+        if fh_trend:
+            t15 = primary_data.get("trend", "")
+            agree_marker = ""
+            if "Uptrend" in t15 and "Uptrend" in fh_trend:
+                agree_marker = " ✅ aligned with 15m"
+            elif "Downtrend" in t15 and "Downtrend" in fh_trend:
+                agree_marker = " ✅ aligned with 15m"
+            elif (("Uptrend" in t15 and "Downtrend" in fh_trend) or
+                  ("Downtrend" in t15 and "Uptrend" in fh_trend)):
+                agree_marker = " ⚠️ disagrees with 15m"
+            fh_lines.append(f"  Trend:   {fh_trend}{agree_marker}")
+        if fh_rsi is not None:
+            fh_lines.append(f"  RSI(14): {rsi_label(fh_rsi)}")
+        if primary_data.get("4h_support") is not None:
+            fh_lines.append(f"  Support: {primary_data['4h_support']}")
+        if primary_data.get("4h_resistance") is not None:
+            fh_lines.append(f"  Resist:  {primary_data['4h_resistance']}")
+        fvg_4h = primary_data.get("4h_fvg") or {}
+        if fvg_4h:
+            fvg_emoji = "🟢" if fvg_4h["type"] == "bullish" else "🔴"
+            fh_lines.append(f"  FVG:     {fvg_emoji} {fvg_label(fvg_4h)}")
+        fib_4h = primary_data.get("4h_fib") or {}
+        if fib_4h:
+            fh_lines.append(
+                f"  EQ(0.5): {fib_4h['equilibrium']} | "
+                f"0.382: {fib_4h['fib_0382']} | 0.618: {fib_4h['fib_0618']}"
+            )
+            fh_lines.append(
+                f"  Nearest: {fib_4h['nearest_level']} @ {fib_4h['nearest_price']} "
+                f"({fib_4h['proximity_pct']}% away)"
+            )
+        ob_4h = primary_data.get("4h_ob") or {}
+        if ob_4h.get("bullish"):
+            b = ob_4h["bullish"]
+            fh_lines.append(f"  Bull OB: {b['low']} – {b['high']} ({b['status']})")
+        if ob_4h.get("bearish"):
+            br = ob_4h["bearish"]
+            fh_lines.append(f"  Bear OB: {br['low']} – {br['high']} ({br['status']})")
+        ms_4h = primary_data.get("4h_market_structure") or {}
+        if ms_4h:
+            fh_lines.append(f"  Struct:  {ms_4h.get('structure', '')}")
+            if ms_4h.get("event"):
+                fh_lines.append(f"  ⚡ {ms_4h['event']}")
+        if primary_data.get("4h_liquidity_sweep"):
+            fh_lines.append(f"  ⚡ {primary_data['4h_liquidity_sweep']}")
+        if fh_lines:
+            fourh_section = "📊 *4h chart:*\n" + "\n".join(fh_lines) + "\n\n"
+
+    # ── Daily chart ───────────────────────────────────────────────────────────
     daily_lines = []
     if primary_data.get("daily_trend"):
         daily_lines.append(f"  Trend:   {primary_data['daily_trend']}")
@@ -1576,7 +2368,21 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         daily_lines.append(f"  Support: {primary_data['daily_support']}")
     if primary_data.get("daily_resistance") is not None:
         daily_lines.append(f"  Resist:  {primary_data['daily_resistance']}")
-    daily_section = "🗓 *Daily chart context:*\n" + "\n".join(daily_lines) + "\n\n" if daily_lines else ""
+    fib_d = primary_data.get("daily_fib") or {}
+    if fib_d:
+        daily_lines.append(
+            f"  EQ(0.5): {fib_d['equilibrium']} | "
+            f"0.382: {fib_d['fib_0382']} | 0.618: {fib_d['fib_0618']}"
+        )
+        daily_lines.append(
+            f"  TP targets: 1.272={fib_d['fib_1272']} | 1.618={fib_d['fib_1618']}"
+        )
+    ms_d = primary_data.get("daily_market_structure") or {}
+    if ms_d:
+        daily_lines.append(f"  Struct:  {ms_d.get('structure', '')}")
+        if ms_d.get("event"):
+            daily_lines.append(f"  ⚡ {ms_d['event']}")
+    daily_section = "🗓 *Daily chart:*\n" + "\n".join(daily_lines) + "\n\n" if daily_lines else ""
 
     # Signal confidence
     conf_score, conf_total = signal_confidence(primary_data, bias)
@@ -1638,8 +2444,10 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         f"{levels_section}"
         f"{fg_section}"
         f"{dxy_section}"
+        f"{fivem_section}"
         f"{ta_section}"
         f"{hourly_section}"
+        f"{fourh_section}"
         f"{daily_section}"
         f"🎯 *Assets affected:*\n{sanitize(ai['AFFECTS'])}\n\n"
         f"👀 *Watch for:*\n{sanitize(ai['WATCH'])}\n\n"
