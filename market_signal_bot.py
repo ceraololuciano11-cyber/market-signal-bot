@@ -31,6 +31,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from difflib import SequenceMatcher
+from zoneinfo import ZoneInfo
 
 # ─────────────────────────────
 # CONFIG
@@ -257,8 +258,32 @@ def is_weekend() -> bool:
 # ─────────────────────────────
 # TIME HELPERS
 # ─────────────────────────────
+ZURICH_TZ = ZoneInfo("Europe/Zurich")
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def zurich_now() -> datetime:
+    return datetime.now(ZURICH_TZ)
+
+def is_zurich_quiet_hours() -> bool:
+    """True between 23:00 and 06:30 Zürich time — no signals sent during this window."""
+    zh = zurich_now()
+    h, m = zh.hour, zh.minute
+    if h == 23:
+        return True
+    if h < 6 or (h == 6 and m < 30):
+        return True
+    return False
+
+def should_send_morning_recap(state: dict) -> bool:
+    """True once per day when the clock crosses 06:30 Zürich and recap not yet sent."""
+    zh = zurich_now()
+    # Only trigger from 06:30 onwards
+    if zh.hour < 6 or (zh.hour == 6 and zh.minute < 30):
+        return False
+    today = zh.date().isoformat()
+    return state.get("__last_recap_date__") != today
 
 def is_market_open() -> bool:
     now  = now_utc()
@@ -1511,6 +1536,7 @@ def load_state() -> dict:
         data.setdefault("__event_warnings_sent__",  {})
         data.setdefault("__last_breakouts__",       {})
         data.setdefault("__last_prices__",          {})
+        data.setdefault("__last_recap_date__",      "")
         return data
     except Exception:
         return {
@@ -1523,6 +1549,7 @@ def load_state() -> dict:
             "__event_warnings_sent__":  {},
             "__last_breakouts__":       {},
             "__last_prices__":          {},
+            "__last_recap_date__":      "",
         }
 
 def save_state(state: dict):
@@ -2488,25 +2515,10 @@ def send_telegram(msg: str, retries: int = 3) -> bool:
 # HEARTBEAT — once per day at 7 AM UTC
 # ─────────────────────────────
 def maybe_send_heartbeat(state: dict, calendar_events: list):
-    now   = now_utc()
-    today = now.date().toordinal()
-    if state.get("__heartbeat_day__") == today:
-        return
-    if now.hour != 7:
-        return
-    cal_line = ""
-    if calendar_events:
-        events_str = ", ".join([f"{e['title']} ({e['currency']})" for e in calendar_events])
-        cal_line   = f"\n📅 *High-impact events today:* {events_str}"
-
-    # Only mark done if Telegram actually confirms delivery
-    if send_telegram(
-        f"💓 *Bot alive* — {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"Threshold: {SCORE_THRESHOLD}/100 | Cooldown: {SYMBOL_COOLDOWN_MIN}min/symbol\n"
-        f"Watching {len(ASSET_MAP)} assets across {len(ALL_FEEDS)} feeds"
-        f"{cal_line}"
-    ):
-        state["__heartbeat_day__"] = today
+    # Replaced by send_morning_recap() — the 06:30 Zürich brief is now the
+    # daily "bot alive" signal. Keeping this function as a no-op so any
+    # existing call sites don't crash.
+    pass
 
 # ─────────────────────────────
 # WEEKLY SUMMARY — Monday 7 AM UTC
@@ -2751,10 +2763,223 @@ def maybe_send_price_alerts(state: dict):
     }
 
 # ─────────────────────────────
+# MORNING RECAP  (06:30 Zürich)
+# ─────────────────────────────
+def send_morning_recap(state: dict) -> bool:
+    """Morning brief — replaces the old heartbeat. Fires once at 06:30 Zürich.
+
+    Three modes depending on the day:
+      Mon 06:30  → Full weekend crypto recap (Fri night → now, ~60 h window)
+      Sat/Sun    → Crypto overnight recap (last 8 h, crypto-only feeds)
+      Tue–Fri    → All-market overnight recap (last 8 h, all feeds)
+    """
+    print("  Generating morning recap...")
+    zh       = zurich_now()
+    weekday  = zh.weekday()   # 0=Mon … 6=Sun
+    is_monday  = weekday == 0
+    is_weekend = weekday >= 5  # Sat=5, Sun=6
+
+    # ── 1. Decide scope ──────────────────────────────────────────────────────
+    _crypto_feeds = [(url, "🪙 CRYPTO") for url in [
+        "https://www.coindesk.com/arc/outbound/rss/",
+        "https://cointelegraph.com/rss",
+        "https://decrypt.co/feed",
+        "https://www.investing.com/rss/news_301.rss",
+        "https://www.theblock.co/rss.xml",
+        "https://blockworks.co/feed",
+    ]]
+
+    if is_monday:
+        # Monday is a double session:
+        #   • Crypto ran all weekend  → 62 h news window, crypto feeds
+        #   • Regular markets opened at 00:00 Zürich → also scan all feeds + all assets
+        # We use ALL_FEEDS with 62 h so both crypto weekend news AND the
+        # early Monday morning market moves are captured in one combined recap.
+        news_hours   = 62
+        feeds_to_use = ALL_FEEDS          # all feeds: catches crypto weekend + early market open
+        crypto_only  = False              # show ALL asset movers (markets opened at midnight)
+        recap_title  = "🌅 *Good morning — Monday Recap (Weekend Crypto + Market Open)*"
+        scope_label  = "Full weekend crypto + markets since 00:00 Zürich"
+    elif is_weekend:
+        news_hours   = 8
+        feeds_to_use = _crypto_feeds
+        crypto_only  = True
+        recap_title  = "🌅 *Good morning — Crypto Overnight Recap*"
+        scope_label  = "Last 8 hours (crypto)"
+    else:
+        news_hours   = 8
+        feeds_to_use = ALL_FEEDS
+        crypto_only  = False
+        recap_title  = "🌅 *Good morning — Overnight Recap*"
+        scope_label  = "Last 8 hours (all markets)"
+
+    # ── 2. Refresh prices ────────────────────────────────────────────────────
+    refresh_price_cache()
+
+    symbols_pool = list(CRYPTO_SYMBOLS) if crypto_only else list(ASSET_MAP.keys())
+    top_movers   = []
+    for sym in symbols_pool:
+        d = _price_cache.get(sym)
+        if d and d.get("move") is not None:
+            top_movers.append((sym, d["move"], d.get("price", "n/a")))
+    top_movers.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    mover_lines = []
+    for sym, mv, price in top_movers[:10]:
+        arrow  = "📈" if mv > 0 else "📉"
+        prefix = "$" if sym not in FOREX_SYMBOLS else ""
+        mover_lines.append(f"  {arrow} {friendly(sym)}: {mv:+.2f}% | {prefix}{price}")
+    movers_str = "\n".join(mover_lines) if mover_lines else "  No price data available"
+
+    # ── 3. Collect headlines ─────────────────────────────────────────────────
+    cutoff    = now_utc() - timedelta(hours=news_hours)
+    headlines = []
+    for url, _stype in feeds_to_use:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:8]:
+                title = entry.get("title", "").strip()
+                if not title or not is_important(title):
+                    continue
+                try:
+                    pub = parsedate_to_datetime(entry.get("published", ""))
+                    if pub.tzinfo is None:
+                        pub = pub.replace(tzinfo=timezone.utc)
+                    if pub < cutoff:
+                        continue
+                except Exception:
+                    pass   # no timestamp → include anyway
+                if title not in headlines:
+                    headlines.append(title)
+                if len(headlines) >= 20:
+                    break
+        except Exception:
+            pass
+        if len(headlines) >= 20:
+            break
+
+    headlines_str = "\n".join(f"  • {h}" for h in headlines[:20]) if headlines \
+                    else f"  No major headlines in the last {news_hours} hours"
+
+    # ── 4. Sentiment context ─────────────────────────────────────────────────
+    fg  = fetch_fear_greed()
+    vix = _price_cache.get("^VIX")
+    fear_parts = []
+    if fg:
+        fear_parts.append(f"Crypto Fear & Greed: {fg['value']} — {fg['label']}")
+    if vix and vix.get("price") and not crypto_only:
+        fear_parts.append(f"VIX: {vix['price']} ({vix_label(vix['price'])})")
+    fear_str = " | ".join(fear_parts) if fear_parts else "n/a"
+
+    # ── 5. AI brief ──────────────────────────────────────────────────────────
+    if is_monday:
+        task_prompt = """Monday is a double session — crypto ran all weekend AND traditional markets just opened at midnight. Write a Monday morning brief that covers BOTH. Include:
+1. WEEKEND CRYPTO RECAP: What Bitcoin and Ethereum did over the weekend and why (1-2 sentences)
+2. MARKET OPEN OVERNIGHT: What traditional markets (indices, forex, gold, oil) did since they opened at midnight — any gaps, big moves, or surprises?
+3. TOP 3 SETUPS FOR TODAY: The 3 clearest trade setups right now (can be any asset — crypto or traditional)
+4. KEY LEVELS: One key price level for each of those 3 assets
+5. MAIN RISK: The one macro factor most likely to drive volatility today"""
+        asset_scope = "forex (EUR/USD, GBP/USD), indices (S&P 500, NASDAQ, DAX), gold, oil, and crypto (Bitcoin, Ethereum)"
+    elif is_weekend:
+        task_prompt = """Write a sharp crypto morning brief. Cover:
+1. OVERNIGHT SUMMARY: What moved in crypto and why (1-2 sentences)
+2. TOP 2 CRYPTO SETUPS: Bitcoin and Ethereum — current bias and key level
+3. KEY LEVELS: One support and one resistance for each
+4. MAIN RISK: What could flip the overnight move today"""
+        asset_scope = "Bitcoin and Ethereum"
+    else:
+        task_prompt = """Write a sharp morning brief the trader can read in 60 seconds. Cover:
+1. OVERNIGHT SUMMARY: What moved the most and why (1-2 sentences)
+2. TOP 3 ASSETS TO WATCH TODAY: Which 3 assets have the clearest setup and why
+3. KEY LEVELS: For each of those 3 assets, one price level to watch (support or resistance)
+4. MAIN RISK: The one macro factor that could surprise markets today"""
+        asset_scope = "forex (EUR/USD, GBP/USD), indices (S&P 500, NASDAQ, DAX), gold, oil, and crypto"
+
+    prompt = f"""You are a senior trading analyst giving a concise morning briefing.
+The trader watches: {asset_scope}.
+
+Current Zürich time: {zh.strftime('%H:%M on %A %d %b')} | Scope: {scope_label}
+
+━━━ PRICE MOVES ━━━
+{movers_str}
+
+━━━ NEWS HEADLINES ━━━
+{headlines_str}
+
+━━━ MARKET SENTIMENT ━━━
+{fear_str}
+
+━━━ YOUR TASK ━━━
+{task_prompt}
+
+Rules:
+- Use full plain-English names, NEVER tickers
+- Be direct — no fluff, no intro sentence, go straight to the content
+- Numbers only for price levels"""
+
+    try:
+        res = client.messages.create(
+            model      = "claude-sonnet-4-6",
+            max_tokens = 650,
+            messages   = [{"role": "user", "content": prompt}],
+        )
+        brief = res.content[0].text.strip()
+    except Exception as e:
+        print(f"  Morning recap AI error: {e}")
+        brief = "AI unavailable — check markets manually."
+
+    # ── 6. Format & send ─────────────────────────────────────────────────────
+    cal_line = ""
+    if not is_weekend and not is_monday:
+        try:
+            events = fetch_calendar()
+            if events:
+                ev_str   = " | ".join(f"{e['title']} ({e['currency']})" for e in events[:3])
+                cal_line = f"\n📅 *High-impact events today:* {ev_str}\n"
+        except Exception:
+            pass
+
+    msg = (
+        f"{'─' * 28}\n"
+        f"{recap_title}\n"
+        f"{'─' * 28}\n\n"
+        f"⏰ Zürich {zh.strftime('%H:%M')} | {scope_label}\n"
+        f"{cal_line}\n"
+        f"📊 *Top movers:*\n{movers_str}\n\n"
+        f"🧠 *AI brief:*\n{sanitize(brief)}\n\n"
+        f"{'─' * 28}\n"
+        f"Bot watching {len(ASSET_MAP)} assets across {len(ALL_FEEDS)} feeds 🎯"
+    )
+
+    if send_telegram(msg):
+        state["__last_recap_date__"] = zh.date().isoformat()
+        print("  Morning recap sent.")
+        return True
+    return False
+
+
+# ─────────────────────────────
 # MAIN
 # ─────────────────────────────
 def main():
-    print(f"[{now_utc().strftime('%H:%M:%S UTC')}] Bot starting...")
+    zh   = zurich_now()
+    print(f"[{now_utc().strftime('%H:%M:%S UTC')}] Bot starting... "
+          f"(Zürich {zh.strftime('%H:%M')})")
+
+    # ── QUIET HOURS GATE (23:00 – 06:30 Zürich) ─────────────────────────────
+    # During this window the bot wakes every 10 min but sends nothing.
+    # At 06:30 the gate opens and the morning recap fires first.
+    if is_zurich_quiet_hours():
+        print(f"Quiet hours ({zh.strftime('%H:%M')} Zürich) — no signals until 06:30. Sleeping.")
+        return
+
+    state = load_state()
+
+    # ── MORNING RECAP (fires once at 06:30 Zürich) ───────────────────────────
+    if should_send_morning_recap(state):
+        print("Morning recap window — sending overnight brief...")
+        send_morning_recap(state)
+        save_state(state)   # persist __last_recap_date__ immediately
 
     weekend = is_weekend()
 
@@ -2766,8 +2991,6 @@ def main():
         return
     else:
         active_feeds = ALL_FEEDS
-
-    state = load_state()
 
     maybe_send_weekly_summary(state)
 
