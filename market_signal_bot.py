@@ -32,6 +32,7 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
+import yfinance as yf
 
 # ─────────────────────────────
 # CONFIG
@@ -594,41 +595,27 @@ _fear_greed_cache = None
 def fetch_symbol_data(symbol: str):
     """Return price + RSI + EMA + MACD + volume + S/R from 15-min bars."""
     try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{symbol}?interval=15m&range=5d"
-        )
-        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
-        result = r["chart"]["result"][0]
-        meta   = result.get("meta", {})
-        quote  = result["indicators"]["quote"][0]
-
-        # Zip all OHLCV so lists stay aligned (a bar missing any value is dropped)
-        rows = [
-            (o, h, lo, c, v)
-            for o, h, lo, c, v in zip(
-                quote.get("open",   []),
-                quote.get("high",   []),
-                quote.get("low",    []),
-                quote.get("close",  []),
-                quote.get("volume", []),
-            )
-            if None not in (o, h, lo, c) and v is not None and v > 0
-        ]
-        if not rows:
-            return None
-        opens, highs, lows, closes, volumes = map(list, zip(*rows))
-
-        if not closes:
+        df = yf.Ticker(symbol).history(period="5d", interval="15m", auto_adjust=True)
+        if df.empty or len(df) < 2:
             return None
 
-        current    = meta.get("regularMarketPrice") or closes[-1]
-        prev_close = meta.get("chartPreviousClose")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df = df[df["Volume"] > 0]
+        if len(df) < 2:
+            return None
 
-        if prev_close and prev_close > 0:
-            move = round((current - prev_close) / prev_close * 100, 2)
-        else:
-            move = 0.0
+        opens   = df["Open"].tolist()
+        highs   = df["High"].tolist()
+        lows    = df["Low"].tolist()
+        closes  = df["Close"].tolist()
+        volumes = df["Volume"].tolist()
+
+        current    = float(closes[-1])
+        today_date = df.index[-1].date()
+        prev_bars  = df[df.index.map(lambda x: x.date()) < today_date]
+        prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else float(closes[0])
+
+        move = round((current - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0.0
 
         rsi   = calculate_rsi(closes)
         ema20 = calculate_ema(closes, 20)
@@ -686,16 +673,13 @@ def fetch_symbol_data(symbol: str):
 def fetch_daily_context(symbol: str) -> dict:
     """Return daily RSI + trend from 3-month daily bars (big-picture context)."""
     try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{symbol}?interval=1d&range=3mo"
-        )
-        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
-        result = r["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-        closes = [c for c in quote.get("close", []) if c is not None]
-        highs  = [h for h in quote.get("high",  []) if h is not None]
-        lows   = [lo for lo in quote.get("low", []) if lo is not None]
+        df = yf.Ticker(symbol).history(period="3mo", interval="1d", auto_adjust=True)
+        if df.empty:
+            return {}
+        df     = df.dropna(subset=["Open", "High", "Low", "Close"])
+        closes = df["Close"].tolist()
+        highs  = df["High"].tolist()
+        lows   = df["Low"].tolist()
         if not closes:
             return {}
         current       = closes[-1]
@@ -726,14 +710,11 @@ def fetch_hourly_context(symbol: str) -> dict:
     high-confidence — eliminating most fakeouts.
     """
     try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{symbol}?interval=60m&range=1mo"
-        )
-        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
-        result = r["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-        closes = [c for c in quote.get("close", []) if c is not None]
+        df = yf.Ticker(symbol).history(period="1mo", interval="60m", auto_adjust=True)
+        if df.empty:
+            return {}
+        df     = df.dropna(subset=["Close"])
+        closes = df["Close"].tolist()
         if not closes:
             return {}
         current = closes[-1]
@@ -752,24 +733,16 @@ def fetch_hourly_context(symbol: str) -> dict:
 def fetch_5m_context(symbol: str) -> dict:
     """Return 5-minute timeframe data: RSI, trend, S/R, FVG, Fib, and Order Blocks."""
     try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{symbol}?interval=5m&range=5d"
-        )
-        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
-        result = r["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-        rows   = [
-            (o, h, lo, c)
-            for o, h, lo, c in zip(
-                quote.get("open",  []), quote.get("high",  []),
-                quote.get("low",   []), quote.get("close", []),
-            )
-            if None not in (o, h, lo, c)
-        ]
-        if len(rows) < 10:
+        df = yf.Ticker(symbol).history(period="5d", interval="5m", auto_adjust=True)
+        if df.empty:
             return {}
-        opens, highs, lows, closes = map(list, zip(*rows))
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        if len(df) < 10:
+            return {}
+        opens  = df["Open"].tolist()
+        highs  = df["High"].tolist()
+        lows   = df["Low"].tolist()
+        closes = df["Close"].tolist()
         current = closes[-1]
         ema20   = calculate_ema(closes, 20)
         ema50   = calculate_ema(closes, 50)
@@ -796,30 +769,17 @@ def fetch_4h_context(symbol: str) -> dict:
     and group every 4 consecutive bars into one 4h bar.
     """
     try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{symbol}?interval=60m&range=3mo"
-        )
-        r      = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).json()
-        result = r["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-
-        # Zip all OHLC so lists stay aligned
-        rows = [
-            (o, h, lo, c)
-            for o, h, lo, c in zip(
-                quote.get("open",  []), quote.get("high",  []),
-                quote.get("low",   []), quote.get("close", []),
-            )
-            if None not in (o, h, lo, c)
-        ]
-        if len(rows) < 8:
+        df = yf.Ticker(symbol).history(period="3mo", interval="60m", auto_adjust=True)
+        if df.empty:
+            return {}
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        if len(df) < 8:
             return {}
 
-        h1_opens  = [r[0] for r in rows]
-        h1_highs  = [r[1] for r in rows]
-        h1_lows   = [r[2] for r in rows]
-        h1_closes = [r[3] for r in rows]
+        h1_opens  = df["Open"].tolist()
+        h1_highs  = df["High"].tolist()
+        h1_lows   = df["Low"].tolist()
+        h1_closes = df["Close"].tolist()
 
         # Trim to multiple of 4 so grouping is clean
         rem = len(h1_closes) % 4
