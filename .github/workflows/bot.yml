@@ -1,11 +1,13 @@
 name: Market Signal Bot
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes, 24/7
+  workflow_dispatch:           # keep manual trigger for testing
 
 concurrency:
   group: market-signal-bot
-  cancel-in-progress: true
+  cancel-in-progress: true    # never run two instances at once
 
 jobs:
   run:
@@ -15,7 +17,9 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Restore seen headlines cache
+      # Restore seen_headlines.json from the previous run so the bot
+      # remembers which headlines / signals / recap date it already sent.
+      - name: Restore state cache
         uses: actions/cache@v4
         with:
           path: seen_headlines.json
@@ -36,3 +40,12 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_KEY }}
         run: python market_signal_bot.py
+
+      # Save the updated state file even if the bot step failed,
+      # so cooldowns / recap date / seen headlines are never lost.
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen_headlines.json
+          key: seen-${{ github.run_number }}
