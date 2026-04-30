@@ -592,10 +592,10 @@ def chart_url(symbol: str) -> str:
 _price_cache: dict = {}
 _fear_greed_cache = None
 
-def fetch_symbol_data(symbol: str):
+def fetch_symbol_data(symbol: str, ticker=None):
     """Return price + RSI + EMA + MACD + volume + S/R from 15-min bars."""
     try:
-        df = yf.Ticker(symbol).history(period="5d", interval="15m", auto_adjust=True)
+        df = (ticker or yf.Ticker(symbol)).history(period="5d", interval="15m", auto_adjust=True)
         if df.empty or len(df) < 2:
             return None
 
@@ -674,10 +674,10 @@ def fetch_symbol_data(symbol: str):
         print(f"  Data fetch failed for {symbol}: {e}")
         return None
 
-def fetch_daily_context(symbol: str) -> dict:
+def fetch_daily_context(symbol: str, ticker=None) -> dict:
     """Return daily RSI + trend from 3-month daily bars (big-picture context)."""
     try:
-        df = yf.Ticker(symbol).history(period="3mo", interval="1d", auto_adjust=True)
+        df = (ticker or yf.Ticker(symbol)).history(period="3mo", interval="1d", auto_adjust=True)
         if df.empty:
             return {}
         df     = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -705,7 +705,7 @@ def fetch_daily_context(symbol: str) -> dict:
         print(f"  Daily context failed for {symbol}: {e}")
         return {}
 
-def fetch_hourly_context(symbol: str) -> dict:
+def fetch_hourly_context(symbol: str, ticker=None) -> dict:
     """Return 1-hour timeframe trend + RSI for multi-timeframe confirmation.
 
     The 15-minute timeframe used elsewhere catches every short-term wiggle and
@@ -714,7 +714,7 @@ def fetch_hourly_context(symbol: str) -> dict:
     high-confidence — eliminating most fakeouts.
     """
     try:
-        df = yf.Ticker(symbol).history(period="1mo", interval="60m", auto_adjust=True)
+        df = (ticker or yf.Ticker(symbol)).history(period="1mo", interval="60m", auto_adjust=True)
         if df.empty:
             return {}
         df     = df.dropna(subset=["Close"])
@@ -734,10 +734,10 @@ def fetch_hourly_context(symbol: str) -> dict:
         print(f"  Hourly context failed for {symbol}: {e}")
         return {}
 
-def fetch_5m_context(symbol: str) -> dict:
+def fetch_5m_context(symbol: str, ticker=None) -> dict:
     """Return 5-minute timeframe data: RSI, trend, S/R, FVG, Fib, and Order Blocks."""
     try:
-        df = yf.Ticker(symbol).history(period="5d", interval="5m", auto_adjust=True)
+        df = (ticker or yf.Ticker(symbol)).history(period="5d", interval="5m", auto_adjust=True)
         if df.empty:
             return {}
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -766,14 +766,14 @@ def fetch_5m_context(symbol: str) -> dict:
         print(f"  5m context failed for {symbol}: {e}")
         return {}
 
-def fetch_4h_context(symbol: str) -> dict:
+def fetch_4h_context(symbol: str, ticker=None) -> dict:
     """Return 4-hour timeframe data aggregated from 1h bars: RSI, trend, S/R, and FVG.
 
     Yahoo Finance has no native 4h interval, so we fetch 1h data over 3 months
     and group every 4 consecutive bars into one 4h bar.
     """
     try:
-        df = yf.Ticker(symbol).history(period="3mo", interval="60m", auto_adjust=True)
+        df = (ticker or yf.Ticker(symbol)).history(period="3mo", interval="60m", auto_adjust=True)
         if df.empty:
             return {}
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -1382,15 +1382,19 @@ def refresh_price_cache():
         symbols = list(ASSET_MAP.keys()) + list(CONTEXT_SYMBOLS.keys())
 
     for symbol in symbols:
-        data = fetch_symbol_data(symbol)
+        # Create ONE Ticker object per symbol — reused across all timeframe
+        # fetches so yfinance only sets up the session/crumb once per symbol
+        # instead of 5 times. Same data, ~5x fewer HTTP handshakes.
+        ticker = yf.Ticker(symbol)
+        data = fetch_symbol_data(symbol, ticker=ticker)
         if data is not None:
             if symbol in ASSET_MAP:
-                data.update(fetch_5m_context(symbol))
-                data.update(fetch_daily_context(symbol))
-                data.update(fetch_hourly_context(symbol))
-                data.update(fetch_4h_context(symbol))
+                data.update(fetch_5m_context(symbol,    ticker=ticker))
+                data.update(fetch_daily_context(symbol, ticker=ticker))
+                data.update(fetch_hourly_context(symbol,ticker=ticker))
+                data.update(fetch_4h_context(symbol,    ticker=ticker))
             _price_cache[symbol] = data
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     summary = {s: f"{d['move']:+.2f}% @ {d['price']}" for s, d in _price_cache.items()}
     print(f"  Prices: {summary or 'all unavailable'}")
