@@ -2435,7 +2435,7 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         f"{source_section}"
         f"{cal_section}"
         f"📰 *What happened:*\n{sanitize(title)}\n\n"
-        f"💡 *Why trade this:*\n{sanitize(ai['REASON'])}\n\n"
+        f"💡 *Why trade this:*\n{sanitize(ai['REASON'])[:600]}\n\n"
         f"{levels_section}"
         f"{fg_section}"
         f"{dxy_section}"
@@ -2456,6 +2456,9 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
 # TELEGRAM
 # ─────────────────────────────
 def send_telegram(msg: str, retries: int = 3) -> bool:
+    # Telegram hard limit is 4096 chars — truncate gracefully if over
+    if len(msg) > 4000:
+        msg = msg[:3950] + "\n\n_(signal truncated — message too long)_"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(retries):
         try:
