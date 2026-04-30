@@ -600,7 +600,10 @@ def fetch_symbol_data(symbol: str):
             return None
 
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        df = df[df["Volume"] > 0]
+        # Only filter zero-volume bars if the instrument actually has volume.
+        # Indexes like ^VIX always report 0 volume and would be wiped entirely.
+        if df["Volume"].sum() > 0:
+            df = df[df["Volume"] > 0]
         if len(df) < 2:
             return None
 
@@ -611,8 +614,9 @@ def fetch_symbol_data(symbol: str):
         volumes = df["Volume"].tolist()
 
         current    = float(closes[-1])
+        # Use vectorised date comparison — faster than per-row lambda
         today_date = df.index[-1].date()
-        prev_bars  = df[df.index.map(lambda x: x.date()) < today_date]
+        prev_bars  = df[df.index.normalize().date < today_date]
         prev_close = float(prev_bars["Close"].iloc[-1]) if not prev_bars.empty else float(closes[0])
 
         move = round((current - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0.0
