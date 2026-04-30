@@ -2813,9 +2813,11 @@ def send_morning_recap(state: dict) -> bool:
         recap_title  = "🌅 *Good morning — Overnight Recap*"
         scope_label  = "Last 8 hours (all markets)"
 
-    # ── 2. Refresh prices ────────────────────────────────────────────────────
-    refresh_price_cache()
-
+    # ── 2. Read prices from the shared cache populated by main() ─────────────
+    # Do NOT call refresh_price_cache() here — main() already called it once
+    # before invoking this function. Calling it again would clear the cache,
+    # make ~75 Yahoo Finance requests, hit rate limits, and leave _price_cache
+    # empty for the signal loop that runs immediately after the recap.
     symbols_pool = list(CRYPTO_SYMBOLS) if crypto_only else list(ASSET_MAP.keys())
     top_movers   = []
     for sym in symbols_pool:
@@ -2975,12 +2977,6 @@ def main():
 
     state = load_state()
 
-    # ── MORNING RECAP (fires once at 06:30 Zürich) ───────────────────────────
-    if should_send_morning_recap(state):
-        print("Morning recap window — sending overnight brief...")
-        send_morning_recap(state)
-        save_state(state)   # persist __last_recap_date__ immediately
-
     weekend = is_weekend()
 
     if weekend:
@@ -2992,14 +2988,27 @@ def main():
     else:
         active_feeds = ALL_FEEDS
 
+    # Fetch prices once here — both the morning recap and the signal loop
+    # share this same cache. Previously send_morning_recap() called
+    # refresh_price_cache() internally AND main() called it again, causing
+    # Yahoo Finance rate-limits that emptied _price_cache for signals.
+    print("Fetching intraday prices + daily context...")
+    refresh_price_cache()
+
+    # ── MORNING RECAP (fires once at 06:30 Zürich) ───────────────────────────
+    if should_send_morning_recap(state):
+        print("Morning recap window — sending overnight brief...")
+        try:
+            send_morning_recap(state)
+        except Exception as e:
+            print(f"  Morning recap error (non-fatal): {e}")
+        save_state(state)   # persist __last_recap_date__ regardless
+
     maybe_send_weekly_summary(state)
 
     calendar_events = fetch_calendar() if not weekend else []
 
     maybe_send_heartbeat(state, calendar_events)
-
-    print("Fetching intraday prices + daily context...")
-    refresh_price_cache()
 
     # ── PRE-EVENT WARNINGS ───────────────────────────────────────────────
     maybe_send_event_warnings(state, calendar_events)
