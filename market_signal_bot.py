@@ -2954,7 +2954,6 @@ Rules:
     )
 
     if send_telegram(msg):
-        state["__last_recap_date__"] = zh.date().isoformat()
         print("  Morning recap sent.")
         return True
     return False
@@ -2998,11 +2997,15 @@ def main():
     # ── MORNING RECAP (fires once at 06:30 Zürich) ───────────────────────────
     if should_send_morning_recap(state):
         print("Morning recap window — sending overnight brief...")
+        # Mark the date and persist to disk BEFORE sending — this prevents
+        # concurrent GitHub Actions runs from both passing the check and
+        # sending duplicate recaps.
+        state["__last_recap_date__"] = zurich_now().date().isoformat()
+        save_state(state)
         try:
             send_morning_recap(state)
         except Exception as e:
             print(f"  Morning recap error (non-fatal): {e}")
-        save_state(state)   # persist __last_recap_date__ regardless
 
     maybe_send_weekly_summary(state)
 
