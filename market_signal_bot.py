@@ -515,6 +515,18 @@ def signal_confidence(data: dict, bias: str):
         elif bias == "SELL" and vix_price <= 14:
             score += 1
 
+    # Order flow delta — does buy/sell pressure confirm the bias?
+    # Counts both 15m (primary) and 4h (macro confirmation) if present.
+    of_15 = data.get("order_flow") or {}
+    of_4h = data.get("4h_order_flow") or {}
+    for of in [of_15, of_4h]:
+        if of and bias in ("BUY", "SELL"):
+            total += 1
+            if bias == "BUY" and of.get("of_bias") == "bullish":
+                score += 1
+            elif bias == "SELL" and of.get("of_bias") == "bearish":
+                score += 1
+
     return score, total
 
 def confidence_bar(score: int, total: int) -> str:
@@ -683,6 +695,7 @@ def fetch_daily_context(symbol: str, ticker=None) -> dict:
         if df.empty:
             return {}
         df     = df.dropna(subset=["Open", "High", "Low", "Close"])
+        opens  = df["Open"].tolist()
         closes = df["Close"].tolist()
         highs  = df["High"].tolist()
         lows   = df["Low"].tolist()
@@ -695,6 +708,7 @@ def fetch_daily_context(symbol: str, ticker=None) -> dict:
         d_trend       = trend_label(current, d_ema20, d_ema50)
         d_support     = round(min(lows[-30:]),  4) if len(lows)  >= 2 else None
         d_resistance  = round(max(highs[-30:]), 4) if len(highs) >= 2 else None
+        volumes       = df["Volume"].tolist()
         return {
             "daily_trend":            d_trend,
             "daily_rsi":              d_rsi,
@@ -702,6 +716,7 @@ def fetch_daily_context(symbol: str, ticker=None) -> dict:
             "daily_resistance":       d_resistance,
             "daily_fib":              detect_fibonacci(highs, lows, closes),
             "daily_market_structure": detect_market_structure(highs, lows, closes),
+            "daily_order_flow":       calculate_order_flow(opens, closes, volumes, session_bars=20),
         }
     except Exception as e:
         print(f"  Daily context failed for {symbol}: {e}")
@@ -745,10 +760,11 @@ def fetch_5m_context(symbol: str, ticker=None) -> dict:
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         if len(df) < 10:
             return {}
-        opens  = df["Open"].tolist()
-        highs  = df["High"].tolist()
-        lows   = df["Low"].tolist()
-        closes = df["Close"].tolist()
+        opens   = df["Open"].tolist()
+        highs   = df["High"].tolist()
+        lows    = df["Low"].tolist()
+        closes  = df["Close"].tolist()
+        volumes = df["Volume"].tolist()
         current = closes[-1]
         ema20   = calculate_ema(closes, 20)
         ema50   = calculate_ema(closes, 50)
@@ -763,6 +779,7 @@ def fetch_5m_context(symbol: str, ticker=None) -> dict:
             "5m_market_structure": detect_market_structure(highs, lows, closes),
             "5m_candle_pattern":   detect_candle_pattern(opens, highs, lows, closes),
             "5m_liquidity_sweep":  detect_liquidity_sweep(highs, lows, closes),
+            "5m_order_flow":       calculate_order_flow(opens, closes, volumes),
         }
     except Exception as e:
         print(f"  5m context failed for {symbol}: {e}")
@@ -782,24 +799,27 @@ def fetch_4h_context(symbol: str, ticker=None) -> dict:
         if len(df) < 8:
             return {}
 
-        h1_opens  = df["Open"].tolist()
-        h1_highs  = df["High"].tolist()
-        h1_lows   = df["Low"].tolist()
-        h1_closes = df["Close"].tolist()
+        h1_opens   = df["Open"].tolist()
+        h1_highs   = df["High"].tolist()
+        h1_lows    = df["Low"].tolist()
+        h1_closes  = df["Close"].tolist()
+        h1_volumes = df["Volume"].tolist()
 
         # Trim to multiple of 4 so grouping is clean
         rem = len(h1_closes) % 4
         if rem:
-            h1_opens  = h1_opens[rem:]
-            h1_highs  = h1_highs[rem:]
-            h1_lows   = h1_lows[rem:]
-            h1_closes = h1_closes[rem:]
+            h1_opens   = h1_opens[rem:]
+            h1_highs   = h1_highs[rem:]
+            h1_lows    = h1_lows[rem:]
+            h1_closes  = h1_closes[rem:]
+            h1_volumes = h1_volumes[rem:]
 
-        n4     = len(h1_closes) // 4
-        opens  = [h1_opens[i*4]                 for i in range(n4)]  # open of first 1h bar
-        highs  = [max(h1_highs[i*4 : i*4+4])   for i in range(n4)]
-        lows   = [min(h1_lows[i*4  : i*4+4])   for i in range(n4)]
-        closes = [h1_closes[i*4+3]              for i in range(n4)]  # close of last 1h bar
+        n4      = len(h1_closes) // 4
+        opens   = [h1_opens[i*4]                   for i in range(n4)]
+        highs   = [max(h1_highs[i*4 : i*4+4])     for i in range(n4)]
+        lows    = [min(h1_lows[i*4  : i*4+4])     for i in range(n4)]
+        closes  = [h1_closes[i*4+3]                for i in range(n4)]
+        volumes = [sum(h1_volumes[i*4 : i*4+4])   for i in range(n4)]
 
         if len(closes) < 10:
             return {}
@@ -817,6 +837,7 @@ def fetch_4h_context(symbol: str, ticker=None) -> dict:
             "4h_ob":               detect_order_blocks(opens, highs, lows, closes),
             "4h_market_structure": detect_market_structure(highs, lows, closes),
             "4h_liquidity_sweep":  detect_liquidity_sweep(highs, lows, closes),
+            "4h_order_flow":       calculate_order_flow(opens, closes, volumes, session_bars=30),
         }
     except Exception as e:
         print(f"  4h context failed for {symbol}: {e}")
@@ -1670,8 +1691,17 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
             vol_bonus = 10
             break
 
+    # Delta flip bonus — a confirmed order flow reversal adds conviction
+    delta_bonus = 0
+    for d in moves.values():
+        of = d.get("order_flow") or {}
+        if of.get("delta_flip"):
+            delta_bonus = 8
+            break
+
     total = min(100, freshness + macro_bonus + energy_bonus + crypto_bonus
-                     + analysis_bonus + breadth_bonus + source_bonus + vol_bonus)
+                     + analysis_bonus + breadth_bonus + source_bonus
+                     + vol_bonus + delta_bonus)
     return total, reaction
 
 def label(s: int) -> str:
@@ -1783,6 +1813,7 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
         "market_structure": primary_data.get("5m_market_structure"),
         "candle_pattern":   primary_data.get("5m_candle_pattern"),
         "liquidity_sweep":  primary_data.get("5m_liquidity_sweep"),
+        "order_flow":       primary_data.get("5m_order_flow"),
         "price":            _price,
     }
     tech_5m = _build_tech_block(data_5m, "5-minute chart") if any(v for v in data_5m.values() if v) else ""
@@ -1803,6 +1834,7 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
         "ob":               primary_data.get("4h_ob"),
         "market_structure": primary_data.get("4h_market_structure"),
         "liquidity_sweep":  primary_data.get("4h_liquidity_sweep"),
+        "order_flow":       primary_data.get("4h_order_flow"),
         "price":            _price,
     }
     tech_4h = _build_tech_block(data_4h, "4-hour chart") if any(v for v in data_4h.values() if v) else ""
@@ -1814,6 +1846,7 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
         "resistance":       primary_data.get("daily_resistance"),
         "fib":              primary_data.get("daily_fib"),
         "market_structure": primary_data.get("daily_market_structure"),
+        "order_flow":       primary_data.get("daily_order_flow"),
         "price":            _price,
     }
     tech_daily = _build_tech_block(daily_data, "Daily chart") if any(daily_data.values()) else ""
@@ -1875,22 +1908,23 @@ High-impact events today: {cal_str}
 {other_str}
 
 ━━━ YOUR TASK ━━━
-Analyze this headline for {prim_name}. Consider:
+Analyze this headline for {prim_name}. Synthesize ALL data above into one unified view:
 1. What does this news fundamentally mean for this asset?
-2. Do the technicals (RSI, MACD, trend, divergence, multi-timeframe) CONFIRM or CONTRADICT the news bias?
-3. Is the risk/reward worth taking given current S/R levels?
-4. What is the single biggest risk to this trade?
+2. Do the technicals CONFIRM or CONTRADICT? Check: RSI, MACD, trend (all timeframes), divergence, market structure (BOS/CHoCH), order flow delta, liquidity sweeps, VWAP position, candle patterns, premium/discount zone.
+3. Does ORDER FLOW agree with the directional bias? A delta flip or strong cumulative delta in the same direction as the trade is high-conviction confirmation. Disagreement = lower conviction.
+4. Is price at a favourable location (discount for BUY, premium for SELL)? Are there nearby S/R or order blocks that invalidate the setup?
+5. What is the single biggest risk to this trade?
 
 RULES:
 - Always use full plain-English names. NEVER use tickers (QQQ, SPX, GC, CL, BTC, ETH, DXY, NQ etc.)
 - ENTRY, STOP, TARGET are for {prim_name} ONLY — numbers only, no words
-- REASON must cover: (1) news catalyst impact, (2) technical confirmation or warning, (3) exact trade logic
+- REASON must cover: (1) news catalyst, (2) multi-timeframe technical + order flow read, (3) exact trade logic with key level
 
 Return EXACTLY this format, no extra text:
 BIAS: BUY / SELL / NEUTRAL
 IMPACT: [1-10 — how market-moving is this news]
 AFFECTS: [full plain-English names of affected instruments]
-REASON: [3 sentences: catalyst impact + technical read + trade logic]
+REASON: [3 sentences max: catalyst + technicals/order flow read + trade logic]
 ENTRY: [price or range for {prim_name} only — numbers only]
 STOP: [stop loss — single number]
 TARGET: [profit target — single number or range]
@@ -2286,6 +2320,11 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         fivem_lines.append(f"  Candle:  {primary_data['5m_candle_pattern']}")
     if primary_data.get("5m_liquidity_sweep"):
         fivem_lines.append(f"  ⚡ {primary_data['5m_liquidity_sweep']}")
+    of_5m = primary_data.get("5m_order_flow") or {}
+    if of_5m:
+        fivem_lines.append(f"  Delta:   {of_5m['of_bias'].upper()} (cum={of_5m['cum_delta']:+,} | last={of_5m['delta']:+,})")
+        if of_5m.get("delta_flip"):
+            fivem_lines.append(f"  ⚡ {of_5m['delta_flip']}")
     fivem_section = "🕐 *5-min chart:*\n" + "\n".join(fivem_lines) + "\n\n" if fivem_lines else ""
 
     # ── 15m chart ────────────────────────────────────────────────────────────
@@ -2422,6 +2461,11 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
                 fh_lines.append(f"  ⚡ {ms_4h['event']}")
         if primary_data.get("4h_liquidity_sweep"):
             fh_lines.append(f"  ⚡ {primary_data['4h_liquidity_sweep']}")
+        of_4h = primary_data.get("4h_order_flow") or {}
+        if of_4h:
+            fh_lines.append(f"  Delta:   {of_4h['of_bias'].upper()} (cum={of_4h['cum_delta']:+,} | last={of_4h['delta']:+,})")
+            if of_4h.get("delta_flip"):
+                fh_lines.append(f"  ⚡ {of_4h['delta_flip']}")
         if fh_lines:
             fourh_section = "📊 *4h chart:*\n" + "\n".join(fh_lines) + "\n\n"
 
