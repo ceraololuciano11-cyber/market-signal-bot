@@ -647,6 +647,7 @@ def fetch_symbol_data(symbol: str, ticker=None):
         mkt_str    = detect_market_structure(highs, lows, closes)
         candle     = detect_candle_pattern(opens, highs, lows, closes)
         liq_sweep  = detect_liquidity_sweep(highs, lows, closes)
+        order_flow = calculate_order_flow(opens, closes, volumes)
 
         return {
             "move":             move,
@@ -669,6 +670,7 @@ def fetch_symbol_data(symbol: str, ticker=None):
             "market_structure": mkt_str,
             "candle_pattern":   candle,
             "liquidity_sweep":  liq_sweep,
+            "order_flow":       order_flow,
         }
     except Exception as e:
         print(f"  Data fetch failed for {symbol}: {e}")
@@ -1156,6 +1158,66 @@ def calculate_vwap(highs: list, lows: list, closes: list, volumes: list,
         "vwap_u2":   round(vwap + 2 * std, 4),
         "vwap_l2":   round(vwap - 2 * std, 4),
         "position":  position,  # human-readable: "above VWAP (+0.3%)"
+    }
+
+def calculate_order_flow(opens: list, closes: list, volumes: list,
+                         session_bars: int = 40) -> dict:
+    """Estimate order flow delta from OHLCV bars (Bookmap-style approximation).
+
+    Since Yahoo Finance has no L2 bid/ask data, we use the standard retail
+    approximation:
+      Bullish bar (close > open) → all volume = buy pressure
+      Bearish bar (close < open) → all volume = sell pressure
+      Doji (close == open)       → neutral (0)
+
+    Delta     = buy_vol − sell_vol for the last bar
+    Cum delta = Σ delta over the last session_bars window
+
+    Delta flip: the last 3-bar block changed sign vs the prior 3-bar block →
+    buyers overwhelmed sellers (or vice versa) = potential reversal setup.
+    """
+    n = min(len(closes), session_bars)
+    if n < 3:
+        return {}
+
+    o_w = opens[-n:]
+    c_w = closes[-n:]
+    v_w = volumes[-n:]
+
+    deltas = []
+    for o, c, v in zip(o_w, c_w, v_w):
+        if c > o:
+            deltas.append(v)
+        elif c < o:
+            deltas.append(-v)
+        else:
+            deltas.append(0)
+
+    cum_delta  = sum(deltas)
+    last_delta = deltas[-1] if deltas else 0
+
+    # Delta flip: last 3 bars vs prior 3 bars
+    flip = ""
+    if len(deltas) >= 6:
+        recent = sum(deltas[-3:])
+        prior  = sum(deltas[-6:-3])
+        if prior < 0 and recent > 0:
+            flip = "Bullish delta flip — sellers exhausted, buyers taking over"
+        elif prior > 0 and recent < 0:
+            flip = "Bearish delta flip — buyers exhausted, sellers taking over"
+
+    if cum_delta > 0:
+        bias = "bullish"
+    elif cum_delta < 0:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    return {
+        "delta":      round(last_delta),
+        "cum_delta":  round(cum_delta),
+        "delta_flip": flip,
+        "of_bias":    bias,
     }
 
 def detect_market_structure(highs: list, lows: list, closes: list,
@@ -1693,6 +1755,11 @@ def _build_tech_block(d: dict, label: str) -> str:
         lines.append(f"  Candle:     {d['candle_pattern']}")
     if d.get("liquidity_sweep"):
         lines.append(f"  Liq Sweep:  {d['liquidity_sweep']}")
+    of = d.get("order_flow") or {}
+    if of:
+        lines.append(f"  Delta:      {of['of_bias'].upper()} (cum={of['cum_delta']:+,} | last bar={of['delta']:+,})")
+        if of.get("delta_flip"):
+            lines.append(f"  ⚡ {of['delta_flip']}")
     return "\n".join(lines)
 
 def analyze(title: str, reaction: str, moves: dict, signal_type: str,
@@ -2275,6 +2342,11 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         ta_lines.append(f"  Candle:     {primary_data['candle_pattern']}")
     if primary_data.get("liquidity_sweep"):
         ta_lines.append(f"  ⚡ {primary_data['liquidity_sweep']}")
+    of_15 = primary_data.get("order_flow") or {}
+    if of_15:
+        ta_lines.append(f"  Delta:      {of_15['of_bias'].upper()} (cum={of_15['cum_delta']:+,} | last={of_15['delta']:+,})")
+        if of_15.get("delta_flip"):
+            ta_lines.append(f"  ⚡ {of_15['delta_flip']}")
     ta_section = "📈 *Technical (15m):*\n" + "\n".join(ta_lines) + "\n\n" if ta_lines else ""
 
     # ── 1h chart ─────────────────────────────────────────────────────────────
