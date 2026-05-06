@@ -39,6 +39,7 @@ import yfinance as yf
 # ─────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
+CHAT_ID_2      = os.environ.get("CHAT_ID_2", "")   # optional second recipient
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY", "")
 
 SCORE_THRESHOLD      = 55
@@ -2576,27 +2577,37 @@ def send_telegram(msg: str, retries: int = 3) -> bool:
     if len(msg) > 4000:
         msg = msg[:3950] + "\n\n_(signal truncated — message too long)_"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for attempt in range(retries):
-        try:
-            r    = requests.post(
-                url,
-                data={
-                    "chat_id":                  CHAT_ID,
-                    "text":                     msg,
-                    "parse_mode":               "Markdown",
-                    "disable_web_page_preview": "true",
-                },
-                timeout=10,
-            )
-            data = r.json()
-            if r.status_code == 200 and data.get("ok"):
-                return True
-            print(f"  Telegram error (attempt {attempt + 1}): {data}")
-        except Exception as e:
-            print(f"  Telegram attempt {attempt + 1} exception: {e}")
-        time.sleep(3)
-    print("  All Telegram retries exhausted.")
-    return False
+
+    chat_ids = [cid for cid in [CHAT_ID, CHAT_ID_2] if cid]
+    all_ok = True
+
+    for chat_id in chat_ids:
+        sent = False
+        for attempt in range(retries):
+            try:
+                r = requests.post(
+                    url,
+                    data={
+                        "chat_id":                  chat_id,
+                        "text":                     msg,
+                        "parse_mode":               "Markdown",
+                        "disable_web_page_preview": "true",
+                    },
+                    timeout=10,
+                )
+                data = r.json()
+                if r.status_code == 200 and data.get("ok"):
+                    sent = True
+                    break
+                print(f"  Telegram error (attempt {attempt + 1}) [{chat_id}]: {data}")
+            except Exception as e:
+                print(f"  Telegram attempt {attempt + 1} exception [{chat_id}]: {e}")
+            time.sleep(3)
+        if not sent:
+            print(f"  All Telegram retries exhausted for chat_id={chat_id}.")
+            all_ok = False
+
+    return all_ok
 
 # ─────────────────────────────
 # HEARTBEAT — once per day at 7 AM UTC
