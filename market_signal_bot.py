@@ -2579,9 +2579,9 @@ def send_telegram(msg: str, retries: int = 3) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     chat_ids = [cid for cid in [CHAT_ID, CHAT_ID_2] if cid]
-    all_ok = True
+    primary_ok = False  # return value tracks primary CHAT_ID only
 
-    for chat_id in chat_ids:
+    for i, chat_id in enumerate(chat_ids):
         sent = False
         for attempt in range(retries):
             try:
@@ -2605,9 +2605,12 @@ def send_telegram(msg: str, retries: int = 3) -> bool:
             time.sleep(3)
         if not sent:
             print(f"  All Telegram retries exhausted for chat_id={chat_id}.")
-            all_ok = False
+        if i == 0:
+            # Only the primary CHAT_ID determines success — CHAT_ID_2 failures
+            # are logged but must not block state updates (cooldowns, recap flags, etc.)
+            primary_ok = sent
 
-    return all_ok
+    return primary_ok
 
 # ─────────────────────────────
 # HEARTBEAT — once per day at 7 AM UTC
