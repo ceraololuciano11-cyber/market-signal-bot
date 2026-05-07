@@ -3079,23 +3079,14 @@ def main():
 
     weekend = is_weekend()
 
-    if weekend:
-        print("Weekend mode — running crypto signals only.")
-        active_feeds = WEEKEND_FEEDS
-    elif not is_market_open():
-        print("Market closed — nothing to do.")
-        return
-    else:
-        active_feeds = ALL_FEEDS
-
-    # Fetch prices once here — both the morning recap and the signal loop
-    # share this same cache. Previously send_morning_recap() called
-    # refresh_price_cache() internally AND main() called it again, causing
-    # Yahoo Finance rate-limits that emptied _price_cache for signals.
+    # Fetch prices first — needed for both morning recap and signals.
     print("Fetching intraday prices + daily context...")
     refresh_price_cache()
 
     # ── MORNING RECAP (fires once at 06:30 Zürich) ───────────────────────────
+    # Must run BEFORE the market-open gate — US markets are closed at 06:30
+    # Zürich (04:30 UTC), so checking is_market_open() first would skip the
+    # recap entirely every weekday morning.
     if should_send_morning_recap(state):
         print("Morning recap window — sending overnight brief...")
         # Mark the date and persist to disk BEFORE sending — this prevents
@@ -3107,6 +3098,16 @@ def main():
             send_morning_recap(state)
         except Exception as e:
             print(f"  Morning recap error (non-fatal): {e}")
+
+    # ── MARKET OPEN GATE ─────────────────────────────────────────────────────
+    if weekend:
+        print("Weekend mode — running crypto signals only.")
+        active_feeds = WEEKEND_FEEDS
+    elif not is_market_open():
+        print("Market closed — nothing to do.")
+        return
+    else:
+        active_feeds = ALL_FEEDS
 
     maybe_send_weekly_summary(state)
 
