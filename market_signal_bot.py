@@ -14,7 +14,7 @@ Upgrades:
   8.  Volume spike detection — 2x average volume = confirmed move
   9.  Multi-source confirmation — 3+ outlets reporting = score boost
   10. Support & Resistance — auto-detected from recent price data
-  11. Crypto Fear & Greed Index — from alternative.me (free, no key)
+  11. Real order flow via Polygon.io — delta, POC, L2 imbalances, absorption
   12. Daily trend context — big-picture RSI + EMA from daily bars
   13. DXY (Dollar Index) — shown as context for macro/forex signals
   14. Signal confidence rating — X/5 indicators aligned
@@ -41,6 +41,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
 CHAT_ID_2      = os.environ.get("CHAT_ID_2", "")   # optional second recipient
 ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY", "")
+POLYGON_KEY    = os.environ.get("POLYGON_KEY", "")  # Polygon.io API key for real order flow
 
 SCORE_THRESHOLD      = 55
 MAX_HEADLINE_AGE_MIN = 45
@@ -66,68 +67,49 @@ NEWS_FEEDS = [
     "https://www.cnbc.com/id/10000664/device/rss/rss.html",
     "https://feeds.finance.yahoo.com/rss/2.0/headline",
     "https://www.investing.com/rss/news.rss",
-    "https://www.investing.com/rss/news_25.rss",   # Forex
     "https://www.investing.com/rss/news_8.rss",    # Stock markets
     "https://www.investing.com/rss/news_14.rss",   # Commodities
-    "https://www.fxstreet.com/rss/news",
     "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
     "https://www.aljazeera.com/xml/rss/all.xml",   # Live geopolitical/war updates
-    "https://www.forexlive.com/feed/news",          # Best real-time macro/forex feed
-    "https://www.kitco.com/rss/kitco-news.xml",     # Gold & precious metals focus
-    "https://oilprice.com/rss/main",                # Oil & energy focus
+    "https://www.kitco.com/rss/kitco-news.xml",    # Gold & precious metals focus
+    "https://oilprice.com/rss/main",               # Oil & energy focus
 ]
 
 ANALYSIS_FEEDS = [
-    "https://www.fxstreet.com/rss/analysis",
-    "https://www.dailyfx.com/feeds/all",            # Professional forex analysis (IG Group)
+    "https://www.investing.com/rss/news_25.rss",   # General financial analysis
 ]
 
-CRYPTO_FEEDS = [
-    "https://www.coindesk.com/arc/outbound/rss/",
-    "https://cointelegraph.com/rss",
-    "https://decrypt.co/feed",
-    "https://www.investing.com/rss/news_301.rss",
-    "https://www.theblock.co/rss.xml",              # Institutional crypto journalism
-    "https://blockworks.co/feed",                   # Macro x crypto intersection
+# Weekend: gold and crude oil trade Sunday evening onward — keep minimal feeds
+WEEKEND_FEEDS = [
+    ("https://www.kitco.com/rss/kitco-news.xml", "📰 NEWS"),
+    ("https://oilprice.com/rss/main",             "📰 NEWS"),
+    ("https://feeds.reuters.com/reuters/businessNews", "📰 NEWS"),
 ]
 
 ALL_FEEDS = (
     [(url, "📰 NEWS") for url in NEWS_FEEDS] +
-    [(url, "📊 ANALYSIS") for url in ANALYSIS_FEEDS] +
-    [(url, "🪙 CRYPTO") for url in CRYPTO_FEEDS]
+    [(url, "📊 ANALYSIS") for url in ANALYSIS_FEEDS]
 )
-
-WEEKEND_FEEDS = [(url, "🪙 CRYPTO") for url in CRYPTO_FEEDS]
 
 # ─────────────────────────────
 # ASSET MAP & FRIENDLY NAMES
 # ─────────────────────────────
 ASSET_MAP = {
-    "GC=F":     ["gold", "xau", "bullion", "precious metal"],
-    "ALI=F":    ["aluminium", "aluminum", "alcoa", "bauxite", "rusal", "aluminium smelter",
-                 "aluminum smelter", "norsk hydro", "hindalco", "aluminium tariff",
-                 "aluminum tariff", "aluminium supply", "aluminum supply"],
-    "CL=F":     ["oil", "crude", "wti", "brent", "opec", "petroleum", "energy"],
-    "^GSPC":    ["s&p", "spx", "spy", "sp500", "s&p 500", "equities", "wall street"],
-    "QQQ":      ["nasdaq", "qqq", "nq", "us100", "tech 100"],
-    "GBPUSD=X": ["gbp", "pound", "sterling", "bank of england"],
-    "EURUSD=X": ["eur", "euro", "ecb", "eurozone", "european central bank"],
-    "BTC-USD":  ["bitcoin", "btc", "crypto", "cryptocurrency", "digital asset", "satoshi", "halving",
-                 "stablecoin", "stablecoins", "usdt", "usdc", "tether",
-                 "blockchain", "tge", "token generation", "web3", "altcoin", "coinbase", "binance"],
-    "ETH-USD":  ["ethereum", "defi", "smart contract", "layer 2", "l2", "eip"],
+    "GC=F":  ["gold", "xau", "bullion", "precious metal"],
+    "ALI=F": ["aluminium", "aluminum", "alcoa", "bauxite", "rusal", "aluminium smelter",
+              "aluminum smelter", "norsk hydro", "hindalco", "aluminium tariff",
+              "aluminum tariff", "aluminium supply", "aluminum supply"],
+    "CL=F":  ["oil", "crude", "wti", "brent", "opec", "petroleum", "energy"],
+    "^GSPC": ["s&p", "spx", "spy", "sp500", "s&p 500", "equities", "wall street"],
+    "QQQ":   ["nasdaq", "qqq", "nq", "us100", "tech 100"],
 }
 
 ASSET_NAMES = {
-    "GC=F":     "Gold (XAU/USD)",
-    "ALI=F":    "Aluminium (ALI/USD)",
-    "CL=F":     "Crude Oil (WTI)",
-    "^GSPC":    "S&P 500",
-    "QQQ":      "US Tech 100 (Nasdaq)",
-    "GBPUSD=X": "GBP/USD (Pound)",
-    "EURUSD=X": "EUR/USD (Euro)",
-    "BTC-USD":  "Bitcoin (BTC/USD)",
-    "ETH-USD":  "Ethereum (ETH/USD)",
+    "GC=F":  "Gold (XAU/USD)",
+    "ALI=F": "Aluminium Futures",
+    "CL=F":  "Crude Oil (WTI)",
+    "^GSPC": "S&P 500",
+    "QQQ":   "US Tech 100 (Nasdaq)",
 }
 
 # Context-only symbols — fetched for data, never trigger signals
@@ -137,10 +119,19 @@ CONTEXT_SYMBOLS = {
 }
 
 # Crypto symbols — trade 24/7 including weekends
-CRYPTO_SYMBOLS = {"BTC-USD", "ETH-USD"}
+# Crypto and forex removed — bot now covers futures + US indices only
+CRYPTO_SYMBOLS: set = set()
+FOREX_SYMBOLS:  set = set()
 
-# Forex pairs are exchange rates — displayed without $ prefix
-FOREX_SYMBOLS = {"GBPUSD=X", "EURUSD=X"}
+# Polygon.io symbol mapping (yfinance symbol → Polygon ticker)
+# Stocks use their ticker directly; futures use CME continuous contract symbols
+POLYGON_SYMBOLS = {
+    "^GSPC": "SPY",    # S&P 500 — use SPY ETF as proxy on Polygon stocks API
+    "QQQ":   "QQQ",    # Nasdaq 100 ETF — direct match
+    "CL=F":  "CL",     # Crude Oil continuous futures
+    "GC=F":  "GC",     # Gold continuous futures
+    "ALI=F": "ALI",    # Aluminum futures
+}
 
 def friendly(symbol: str) -> str:
     return ASSET_NAMES.get(symbol, CONTEXT_SYMBOLS.get(symbol, symbol))
@@ -155,27 +146,14 @@ KEYWORDS = [
     "gold", "xau", "bullion", "precious metal",
     "aluminium", "aluminum", "alcoa", "bauxite", "rusal", "norsk hydro", "hindalco",
     "oil", "crude", "wti", "brent", "opec", "petroleum", "energy",
+    "natural gas", "lng", "pipeline",
     "s&p", "spx", "spy", "sp500", "s&p 500", "wall street", "equities",
     "nasdaq", "qqq", "nq", "us100", "tech 100",
-    "gbp", "pound", "sterling", "bank of england",
-    "eur", "euro", "ecb", "european central bank", "eurozone",
-    "bitcoin", "btc", "ethereum", "crypto", "cryptocurrency",
-    "digital asset", "blockchain", "defi", "halving", "altcoin", "stablecoin",
-    "sec crypto", "etf crypto", "bitcoin etf", "coinbase", "binance",
-    "smart contract", "layer 2", "l2", "on-chain",
-    # Note: "eth" and "ether" intentionally excluded — substrings of "netherlands",
-    # "together", "whether" etc. "ethereum" is specific enough.
+    "tariff", "trade war", "sanctions", "geopolit", "conflict", "war",
 ]
 
-CRYPTO_KEYWORDS = [
-    "bitcoin", "btc", "ethereum", "crypto", "cryptocurrency",
-    "digital asset", "blockchain", "defi", "halving", "altcoin", "stablecoin",
-    "stablecoins", "usdt", "usdc", "tether", "coinbase", "binance",
-    "bitcoin etf", "sec crypto",
-]
-# Note: "eth" intentionally excluded — it is a substring of "netherlands",
-# "method", "elizabeth" etc. ASSET_MAP still routes ETH headlines correctly.
-# Crypto scoring is handled via signal_type "🪙 CRYPTO" from crypto feeds.
+# Crypto and forex keywords no longer needed — assets removed from bot
+CRYPTO_KEYWORDS: list = []
 
 MACRO_KEYWORDS = [
     "fed", "fomc", "powell", "interest rate", "rate hike", "rate cut",
@@ -242,20 +220,14 @@ def score_headline_sentiment(title: str) -> tuple:
     return raw, "mixed"
 
 def is_weekend() -> bool:
-    """True on Sat/Sun and Fri after 22:00 UTC.
+    """True on Saturday and Sunday.
 
-    Friday after 22:00 UTC is when forex closes for the week, so all
-    traditional markets are shut — only crypto trades. Treating this
-    window as 'weekend' makes the bot stay alive on crypto-only mode
-    instead of returning early via is_market_open and missing 2 hours
-    of crypto signals every week.
+    Gold and crude oil futures trade Sunday evening onward, so Sunday after
+    22:00 UTC is treated as 'market open' by is_market_open() — weekend mode
+    only applies to Saturday and most of Sunday.
     """
     now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:                          # Saturday, Sunday
-        return True
-    if now.weekday() == 4 and now.hour >= 22:       # Friday after forex close
-        return True
-    return False
+    return now.weekday() >= 5  # Saturday=5, Sunday=6
 
 # ─────────────────────────────
 # TIME HELPERS
@@ -504,10 +476,8 @@ def signal_confidence(data: dict, bias: str):
             score += 1
 
     # VIX sentiment — extreme readings are contrarian signals.
-    # Only counted for non-crypto (VIX measures equity/macro fear, not crypto).
     vix_price = data.get("vix_price")
-    is_crypto  = data.get("_is_crypto", False)
-    if vix_price is not None and not is_crypto:
+    if vix_price is not None:
         total += 1
         # Extreme fear (VIX >= 28) supports BUY — fear marks bottoms
         # Extreme complacency (VIX <= 14) supports SELL — greed marks tops
@@ -527,6 +497,24 @@ def signal_confidence(data: dict, bias: str):
                 score += 1
             elif bias == "SELL" and of.get("of_bias") == "bearish":
                 score += 1
+
+    # Polygon Level 2 imbalance — institutional order book depth confirms bias
+    l2_imbalance = data.get("l2_imbalance", "")
+    if l2_imbalance and bias in ("BUY", "SELL"):
+        total += 1
+        if bias == "BUY" and "bid" in l2_imbalance.lower():
+            score += 1
+        elif bias == "SELL" and "ask" in l2_imbalance.lower():
+            score += 1
+
+    # Polygon trade flow imbalance — % of recent trades on buy side
+    buy_pct = data.get("buy_pct")
+    if buy_pct is not None and bias in ("BUY", "SELL"):
+        total += 1
+        if bias == "BUY" and buy_pct >= 60:
+            score += 1
+        elif bias == "SELL" and buy_pct <= 40:
+            score += 1
 
     return score, total
 
@@ -582,15 +570,11 @@ def count_sources(title: str, story_counts: dict) -> int:
 # TRADINGVIEW CHART LINKS
 # ─────────────────────────────
 TRADINGVIEW_SYMBOLS = {
-    "GC=F":     "COMEX:GC1!",
-    "ALI=F":    "COMEX:ALI1!",
-    "CL=F":     "NYMEX:CL1!",
-    "^GSPC":    "SP:SPX",
-    "QQQ":      "NASDAQ:QQQ",
-    "GBPUSD=X": "FX:GBPUSD",
-    "EURUSD=X": "FX:EURUSD",
-    "BTC-USD":  "BITSTAMP:BTCUSD",
-    "ETH-USD":  "BITSTAMP:ETHUSD",
+    "GC=F":  "COMEX:GC1!",
+    "ALI=F": "COMEX:ALI1!",
+    "CL=F":  "NYMEX:CL1!",
+    "^GSPC": "SP:SPX",
+    "QQQ":   "NASDAQ:QQQ",
 }
 
 def chart_url(symbol: str) -> str:
@@ -1242,6 +1226,214 @@ def calculate_order_flow(opens: list, closes: list, volumes: list,
         "of_bias":    bias,
     }
 
+# ─────────────────────────────
+# POLYGON.IO — REAL ORDER FLOW
+# Supplements the yfinance OHLC-based delta approximation with real trade
+# tape and Level 2 order book data where available.
+# Falls back gracefully to {} on any error or missing POLYGON_KEY.
+# ─────────────────────────────
+
+def _polygon_get(path: str, params: dict = None) -> dict:
+    """Single Polygon REST call. Returns parsed JSON or {} on failure."""
+    try:
+        url = f"https://api.polygon.io{path}"
+        p   = {"apiKey": POLYGON_KEY}
+        if params:
+            p.update(params)
+        r = requests.get(url, params=p, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"  Polygon request error ({path}): {e}")
+    return {}
+
+
+def _polygon_real_delta(trades: list) -> dict:
+    """
+    Compute real cumulative delta from Polygon trade tape using the Lee-Ready
+    tick rule:
+      price > prev_price → uptick  → buy volume
+      price < prev_price → downtick → sell volume
+      price = prev_price → use last direction (zero-tick rule)
+    """
+    if len(trades) < 5:
+        return {}
+
+    # API returns newest-first — reverse to get chronological order
+    chrono = list(reversed(trades))
+
+    deltas     = []
+    last_dir   = 0     # 1=buy, -1=sell
+    prev_price = None
+
+    for t in chrono:
+        price = t.get("price", 0)
+        size  = t.get("size", 0)
+        if prev_price is None:
+            prev_price = price
+            continue
+        if price > prev_price:
+            direction = 1
+        elif price < prev_price:
+            direction = -1
+        else:
+            direction = last_dir
+        deltas.append(direction * size)
+        if direction != 0:
+            last_dir = direction
+        prev_price = price
+
+    if not deltas:
+        return {}
+
+    cum_delta  = sum(deltas)
+    last_delta = deltas[-1]
+
+    flip = ""
+    if len(deltas) >= 6:
+        recent = sum(deltas[-3:])
+        prior  = sum(deltas[-6:-3])
+        if prior < 0 and recent > 0:
+            flip = "Bullish delta flip — sellers exhausted, buyers taking over"
+        elif prior > 0 and recent < 0:
+            flip = "Bearish delta flip — buyers exhausted, sellers taking over"
+
+    # Trade flow imbalance — % of last 100 trades on buy side
+    last_100   = deltas[-100:] if len(deltas) >= 100 else deltas
+    buy_vol    = sum(d for d in last_100 if d > 0)
+    sell_vol   = sum(abs(d) for d in last_100 if d < 0)
+    total_vol  = buy_vol + sell_vol
+    buy_pct    = round(buy_vol / total_vol * 100) if total_vol > 0 else 50
+
+    # Point of Control — most traded price level in last 300 trades
+    price_vols: dict = {}
+    for t in chrono[-300:]:
+        p = round(t.get("price", 0), 2)
+        s = t.get("size", 0)
+        price_vols[p] = price_vols.get(p, 0) + s
+    poc = max(price_vols, key=price_vols.get) if price_vols else None
+
+    bias = "bullish" if cum_delta > 0 else "bearish" if cum_delta < 0 else "neutral"
+
+    return {
+        "delta":       round(last_delta),
+        "cum_delta":   round(cum_delta),
+        "delta_flip":  flip,
+        "of_bias":     bias,
+        "buy_pct":     buy_pct,
+        "poc":         poc,
+        "data_source": "polygon_real",
+    }
+
+
+def _polygon_l2_imbalances(book: dict) -> dict:
+    """
+    Compute bid/ask imbalances from Polygon Level 2 snapshot.
+    Stacked imbalance: 3+ consecutive levels where one side is 5x+ the other.
+    """
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
+    if not bids or not asks:
+        return {}
+
+    # Total depth — top 10 levels each side
+    bid_depth = sum(b.get("s", b.get("size", 0)) for b in bids[:10])
+    ask_depth = sum(a.get("s", a.get("size", 0)) for a in asks[:10])
+    total     = bid_depth + ask_depth
+    if total == 0:
+        return {}
+
+    bid_pct = round(bid_depth / total * 100)
+
+    # Stacked imbalance detection
+    bid_imb = ask_imb = 0
+    for i in range(min(len(bids), len(asks), 10)):
+        bs = bids[i].get("s", bids[i].get("size", 0))
+        as_ = asks[i].get("s", asks[i].get("size", 0))
+        if bs > 0 and as_ > 0:
+            if bs / as_ >= 5:
+                bid_imb += 1
+            elif as_ / bs >= 5:
+                ask_imb += 1
+
+    imbalance_signal = ""
+    if bid_imb >= 3:
+        imbalance_signal = f"Stacked bid imbalance ({bid_imb} levels) — institutional buying interest"
+    elif ask_imb >= 3:
+        imbalance_signal = f"Stacked ask imbalance ({ask_imb} levels) — institutional selling interest"
+
+    absorption = ""
+    if bid_pct >= 70:
+        absorption = "Strong bid absorption — large buyer defending price"
+    elif bid_pct <= 30:
+        absorption = "Strong ask absorption — large seller capping price"
+
+    return {
+        "bid_pct":       bid_pct,
+        "l2_imbalance":  imbalance_signal,
+        "l2_absorption": absorption,
+    }
+
+
+def fetch_polygon_order_flow(symbol: str) -> dict:
+    """
+    Fetch real order flow from Polygon.io for a given yfinance symbol.
+
+    Stocks (SPY proxy for ^GSPC, QQQ):
+        — Trade tape via /v3/trades  → real delta (Lee-Ready tick rule)
+        — Level 2 snapshot           → stacked imbalances, absorption
+    Futures (CL, GC, ALI):
+        — Trade tape via /v3/trades  → real delta
+        — Level 2 not available on most futures tiers
+
+    Falls back gracefully to {} if POLYGON_KEY is missing, symbol is not
+    mapped, or any API call fails.
+    """
+    if not POLYGON_KEY:
+        return {}
+    poly_sym = POLYGON_SYMBOLS.get(symbol)
+    if not poly_sym:
+        return {}
+
+    try:
+        is_stock  = symbol in ("^GSPC", "QQQ")
+        is_future = symbol in ("CL=F", "GC=F", "ALI=F")
+
+        # ── Trade tape ────────────────────────────────────────────────────────
+        trades_data = _polygon_get(f"/v3/trades/{poly_sym}",
+                                   {"order": "desc", "limit": 500})
+        trades = trades_data.get("results", [])
+        if not trades:
+            # Futures may need a different path prefix
+            if is_future:
+                trades_data = _polygon_get(f"/v3/trades/I:{poly_sym}",
+                                           {"order": "desc", "limit": 500})
+                trades = trades_data.get("results", [])
+        if not trades:
+            return {}
+
+        result = _polygon_real_delta(trades)
+        if not result:
+            return {}
+
+        # ── Level 2 (stocks only — Developer plan) ───────────────────────────
+        if is_stock:
+            try:
+                book_data = _polygon_get(
+                    f"/v2/snapshot/locale/us/markets/stocks/tickers/{poly_sym}/book"
+                )
+                book = book_data.get("data", book_data.get("results", {}))
+                if book:
+                    result.update(_polygon_l2_imbalances(book))
+            except Exception:
+                pass  # L2 optional — don't fail if not available on this plan
+
+        return result
+
+    except Exception as e:
+        print(f"  Polygon order flow error ({symbol}): {e}")
+        return {}
+
 def detect_market_structure(highs: list, lows: list, closes: list,
                             lookback: int = 60) -> dict:
     """Detect market structure: trend bias, BOS, or CHoCH.
@@ -1459,11 +1651,7 @@ def refresh_price_cache():
     global _price_cache
     _price_cache = {}
 
-    # On weekends only fetch crypto + DXY — all other markets are closed
-    if is_weekend():
-        symbols = list(CRYPTO_SYMBOLS) + list(CONTEXT_SYMBOLS.keys())
-    else:
-        symbols = list(ASSET_MAP.keys()) + list(CONTEXT_SYMBOLS.keys())
+    symbols = list(ASSET_MAP.keys()) + list(CONTEXT_SYMBOLS.keys())
 
     for symbol in symbols:
         # Create ONE Ticker object per symbol — reused across all timeframe
@@ -1477,6 +1665,15 @@ def refresh_price_cache():
                 data.update(fetch_daily_context(symbol, ticker=ticker))
                 data.update(fetch_hourly_context(symbol,ticker=ticker))
                 data.update(fetch_4h_context(symbol,    ticker=ticker))
+
+                # Polygon real order flow — overrides yfinance OHLC approximation
+                # when available. Falls back silently if key missing or API fails.
+                if POLYGON_KEY and symbol in POLYGON_SYMBOLS:
+                    poly_flow = fetch_polygon_order_flow(symbol)
+                    if poly_flow:
+                        data["order_flow"]   = poly_flow   # replaces yfinance approx
+                        data["polygon_flow"] = poly_flow   # also store separately
+
             _price_cache[symbol] = data
         time.sleep(0.3)
 
@@ -1485,25 +1682,17 @@ def refresh_price_cache():
 
 def get_cached_moves(title: str) -> dict:
     title_lower = title.lower()
-    weekend     = is_weekend()
 
-    # Macro events affect everything — but only tradeable assets for the current session
-    if is_macro(title_lower) and not weekend:
+    # Macro events affect all tradeable assets
+    if is_macro(title_lower):
         return {s: d for s, d in _price_cache.items() if s in ASSET_MAP}
 
-    # Try to match a specific asset from the headline
+    # Try to match a specific asset from the headline keywords
     for sym, keywords in ASSET_MAP.items():
-        if weekend and sym not in CRYPTO_SYMBOLS:
-            continue  # Never return a closed market on weekends
         if any(k in title_lower for k in keywords):
             return {sym: _price_cache[sym]} if sym in _price_cache else {}
 
-    # Crypto headline with no specific asset match → default to BTC, never S&P
-    if is_crypto_headline(title_lower):
-        return {"BTC-USD": _price_cache["BTC-USD"]} if "BTC-USD" in _price_cache else {}
-    # Fallback — use BTC on weekends, S&P 500 on weekdays
-    if weekend:
-        return {"BTC-USD": _price_cache["BTC-USD"]} if "BTC-USD" in _price_cache else {}
+    # Fallback — S&P 500 as general market proxy
     return {"^GSPC": _price_cache["^GSPC"]} if "^GSPC" in _price_cache else {}
 
 # ─────────────────────────────
@@ -1643,13 +1832,9 @@ def get_primary_symbol(title: str, moves: dict) -> str:
     for sym, keywords in ASSET_MAP.items():
         if any(k in title.lower() for k in keywords) and sym in moves:
             return sym
-    # Crypto headline with no specific match → BTC, never S&P 500
-    if is_crypto_headline(title):
-        return "BTC-USD"
     if moves:
         return max(moves, key=lambda s: abs(moves[s]["move"]))
-    # Safe fallback — never return a closed market on weekends
-    return "BTC-USD" if is_weekend() else "^GSPC"
+    return "^GSPC"
 
 # ─────────────────────────────
 # SCORING
@@ -1663,12 +1848,8 @@ ENERGY_KEYWORDS = [
 def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
     avg_move   = sum(abs(d["move"]) for d in moves.values()) / len(moves) if moves else 0
     api_failed = len(moves) == 0
-    crypto     = signal_type == "🪙 CRYPTO" or is_crypto_headline(title)
 
-    # ── Unified freshness thresholds ────────────────────────────────────────
-    # Previously crypto had 3-4x looser thresholds than non-crypto, causing
-    # crude/forex to score near-zero whenever they were already moving — exactly
-    # when signals are most needed. Now every asset class uses the same scale.
+    # ── Freshness thresholds ─────────────────────────────────────────────────
     if avg_move < 1.0:   freshness, reaction = 50, "FRESH"
     elif avg_move < 2.5: freshness, reaction = 40, "WARMING"
     elif avg_move < 5.0: freshness, reaction = 25, "MOVING"
@@ -1676,12 +1857,8 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
     else:                freshness, reaction = 0,  "PRICED IN"
 
     # ── Bonuses ─────────────────────────────────────────────────────────────
-    macro_bonus  = 20 if is_macro(title) else 0
-    # Energy/commodity bonus — matches macro_bonus so oil/gold aren't ignored
-    energy_bonus = 15 if any(k in title.lower() for k in ENERGY_KEYWORDS) else 0
-    # Crypto bonus halved — crypto feeds (6 feeds) already generate far more
-    # volume than commodity/forex feeds; +20 was creating a ~30pt unfair advantage
-    crypto_bonus   = 10 if crypto else 0
+    macro_bonus    = 20 if is_macro(title) else 0
+    energy_bonus   = 15 if any(k in title.lower() for k in ENERGY_KEYWORDS) else 0
     analysis_bonus = 10 if signal_type == "📊 ANALYSIS" else 0
     breadth_bonus  = 10 if api_failed else min(20, len(moves) * 4)
     source_bonus   = min(20, (src_count - 1) * 7)
@@ -1692,7 +1869,7 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
             vol_bonus = 10
             break
 
-    # Delta flip bonus — a confirmed order flow reversal adds conviction
+    # Delta flip bonus — confirmed order flow reversal adds conviction
     delta_bonus = 0
     for d in moves.values():
         of = d.get("order_flow") or {}
@@ -1700,9 +1877,17 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
             delta_bonus = 8
             break
 
-    total = min(100, freshness + macro_bonus + energy_bonus + crypto_bonus
+    # Polygon real data bonus — real tick-classified delta is more reliable
+    # than the yfinance OHLC approximation; small boost for confirmed signals
+    polygon_bonus = 0
+    for d in moves.values():
+        if d.get("polygon_flow", {}).get("data_source") == "polygon_real":
+            polygon_bonus = 5
+            break
+
+    total = min(100, freshness + macro_bonus + energy_bonus
                      + analysis_bonus + breadth_bonus + source_bonus
-                     + vol_bonus + delta_bonus)
+                     + vol_bonus + delta_bonus + polygon_bonus)
     return total, reaction
 
 def label(s: int) -> str:
@@ -1869,20 +2054,39 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
 
     # ── Market fear context ───────────────────────────────────────────────────
     vix_d = _price_cache.get("^VIX")
-    if vix_d and primary_symbol not in CRYPTO_SYMBOLS:
-        fear_str = f"VIX: {vix_d.get('price', 'n/a')} — {vix_label(vix_d.get('price', 0)) if vix_d.get('price') else 'n/a'}"
-    elif primary_symbol in CRYPTO_SYMBOLS:
-        fg = fetch_fear_greed()
-        fear_str = f"Crypto Fear & Greed: {fg['value']} — {fg['label']}" if fg else "n/a"
-    else:
-        fear_str = "n/a"
+    fear_str = (
+        f"VIX: {vix_d.get('price', 'n/a')} — {vix_label(vix_d.get('price', 0)) if vix_d and vix_d.get('price') else 'n/a'}"
+        if vix_d else "n/a"
+    )
 
     # ── DXY context ──────────────────────────────────────────────────────────
     dxy_d = _price_cache.get("DX-Y.NYB")
     dxy_str = f"DXY: {dxy_d['price']} ({dxy_d['move']:+.2f}% today) | {dxy_d.get('trend','n/a')}" if dxy_d else "n/a"
 
-    macro_note  = "This is a macro event affecting all instruments." if is_macro(title) else ""
-    crypto_note = "This is a crypto headline — focus on Bitcoin (BTC/USD) and Ethereum (ETH/USD)." if is_crypto_headline(title) else ""
+    macro_note = "This is a macro event affecting all instruments." if is_macro(title) else ""
+
+    # ── Polygon real order flow context ──────────────────────────────────────
+    poly_flow = primary_data.get("polygon_flow") or primary_data.get("order_flow") or {}
+    polygon_context = ""
+    if poly_flow.get("data_source") == "polygon_real":
+        parts = []
+        delta = poly_flow.get("cum_delta")
+        if delta is not None:
+            parts.append(f"Real cumulative delta: {delta:+,.0f}")
+        buy_pct = poly_flow.get("buy_pct")
+        if buy_pct is not None:
+            parts.append(f"Buy-side flow: {buy_pct}%")
+        poc = poly_flow.get("poc")
+        if poc is not None:
+            parts.append(f"Point of control: {poc}")
+        l2 = poly_flow.get("l2_imbalance")
+        if l2:
+            parts.append(f"L2 imbalance: {l2}")
+        absorption = poly_flow.get("l2_absorption")
+        if absorption:
+            parts.append(f"Absorption: {absorption}")
+        if parts:
+            polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon) ━━━\n" + "\n".join(parts)
 
     prim_name = friendly(primary_symbol) if primary_symbol else "the most affected asset"
     prim_price = primary_data.get("price", "n/a")
@@ -1903,7 +2107,7 @@ Signal type: {signal_type} | Market reaction so far: {reaction}
 Market fear: {fear_str}
 Dollar Index: {dxy_str}
 High-impact events today: {cal_str}
-{macro_note}{crypto_note}
+{macro_note}{polygon_context}
 
 ━━━ OTHER INSTRUMENTS (context) ━━━
 {other_str}
@@ -2248,11 +2452,10 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     # (e.g. missing price data on a directional signal).
     primary_data = dict(moves.get(primary_symbol, {}))  # copy so we can annotate safely
 
-    # Inject VIX and crypto flag into primary_data so signal_confidence can use them
+    # Inject VIX into primary_data so signal_confidence can use it
     vix_data = _price_cache.get("^VIX")
     if vix_data:
         primary_data["vix_price"] = vix_data.get("price")
-    primary_data["_is_crypto"] = primary_symbol in CRYPTO_SYMBOLS
 
     computed_levels = compute_trade_levels(bias, primary_data)
     if computed_levels:
@@ -2507,28 +2710,47 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     if streak_section:
         streak_section += "\n"
 
-    # Fear & Greed — crypto uses the Crypto F&G index; all other assets use VIX
+    # VIX — market fear gauge
     fg_section = ""
-    if primary_symbol in CRYPTO_SYMBOLS:
-        fg = fetch_fear_greed()
-        if fg:
-            emoji = fg_emoji(fg["value"])
-            fg_section = f"{emoji} *Crypto Fear & Greed: {fg['value']} — {fg['label']}*\n\n"
-    elif vix_data:
+    if vix_data:
         vix_price = vix_data.get("price")
         if vix_price:
             note = vix_signal_note(vix_price, bias)
             fg_section = f"📊 *Market Fear (VIX):* {vix_label(vix_price)}{note}\n\n"
 
-    # DXY context (macro/forex signals)
+    # DXY context — shown for macro events, gold, and oil signals
     dxy_section = ""
-    is_forex_or_macro = is_macro(title) or primary_symbol in {"GBPUSD=X", "EURUSD=X"}
-    if is_forex_or_macro and "DX-Y.NYB" in _price_cache:
+    show_dxy = is_macro(title) or primary_symbol in {"GC=F", "CL=F"}
+    if show_dxy and "DX-Y.NYB" in _price_cache:
         dxy = _price_cache["DX-Y.NYB"]
         dxy_section = (
             f"💵 *US Dollar Index (DXY):* {dxy['price']} ({dxy['move']:+.2f}% today)"
             f" | {dxy.get('trend', 'n/a')}\n\n"
         )
+
+    # Polygon real order flow section (only if real data available)
+    poly_section = ""
+    poly_flow = primary_data.get("polygon_flow") or primary_data.get("order_flow") or {}
+    if poly_flow.get("data_source") == "polygon_real":
+        poly_lines = ["📡 *Real Order Flow (Polygon):*"]
+        delta = poly_flow.get("cum_delta")
+        if delta is not None:
+            delta_sign = "+" if delta >= 0 else ""
+            poly_lines.append(f"  Delta: {delta_sign}{delta:,.0f} 🟢 REAL DATA")
+        buy_pct = poly_flow.get("buy_pct")
+        if buy_pct is not None:
+            side = "Buy" if buy_pct >= 50 else "Sell"
+            poly_lines.append(f"  Flow: {buy_pct}% {side}-side pressure")
+        poc = poly_flow.get("poc")
+        if poc is not None:
+            poly_lines.append(f"  POC: {poc} (most traded price)")
+        l2 = poly_flow.get("l2_imbalance")
+        if l2:
+            poly_lines.append(f"  L2: {l2}")
+        absorption = poly_flow.get("l2_absorption")
+        if absorption:
+            poly_lines.append(f"  Absorption: {absorption}")
+        poly_section = "\n".join(poly_lines) + "\n\n"
 
     # Multi-source
     source_section = ""
@@ -2554,6 +2776,7 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         f"📰 *What happened:*\n{sanitize(title)}\n\n"
         f"💡 *Why trade this:*\n{sanitize(ai['REASON'])[:600]}\n\n"
         f"{levels_section}"
+        f"{poly_section}"
         f"{fg_section}"
         f"{dxy_section}"
         f"{fivem_section}"
@@ -2679,15 +2902,11 @@ def maybe_send_weekly_summary(state: dict):
 # ─────────────────────────────
 # Thresholds: how much an asset must move since the LAST bot run to fire an alert.
 PRICE_ALERT_THRESHOLDS = {
-    "GC=F":     1.0,   # Gold     — alert on 1%+ move
-    "ALI=F":    1.5,   # Aluminium
-    "CL=F":     1.5,   # Crude Oil — alert on 1.5%+ move
-    "^GSPC":    1.0,   # S&P 500
-    "QQQ":      1.0,   # Nasdaq
-    "GBPUSD=X": 0.4,   # GBP/USD  — forex moves less
-    "EURUSD=X": 0.4,   # EUR/USD
-    "BTC-USD":  3.0,   # Bitcoin  — volatile, needs bigger threshold
-    "ETH-USD":  3.0,   # Ethereum
+    "GC=F":  1.0,   # Gold      — alert on 1%+ move
+    "ALI=F": 1.5,   # Aluminium
+    "CL=F":  1.5,   # Crude Oil — alert on 1.5%+ move
+    "^GSPC": 1.0,   # S&P 500
+    "QQQ":   1.0,   # Nasdaq
 }
 
 def maybe_send_breakout_alerts(state: dict):
@@ -2706,8 +2925,6 @@ def maybe_send_breakout_alerts(state: dict):
 
     for sym, data in _price_cache.items():
         if sym not in ASSET_MAP:
-            continue
-        if weekend and sym not in CRYPTO_SYMBOLS:
             continue
 
         price = data.get("price")
@@ -2824,8 +3041,6 @@ def maybe_send_price_alerts(state: dict):
     for sym, data in _price_cache.items():
         if sym not in ASSET_MAP:
             continue
-        if weekend and sym not in CRYPTO_SYMBOLS:
-            continue
 
         current = data.get("price")
         if not current:
@@ -2867,61 +3082,38 @@ def maybe_send_price_alerts(state: dict):
 # MORNING RECAP  (06:30 Zürich)
 # ─────────────────────────────
 def send_morning_recap(state: dict) -> bool:
-    """Morning brief — replaces the old heartbeat. Fires once at 06:30 Zürich.
+    """Morning brief — fires once at 06:30 Zürich.
 
-    Three modes depending on the day:
-      Mon 06:30  → Full weekend crypto recap (Fri night → now, ~60 h window)
-      Sat/Sun    → Crypto overnight recap (last 8 h, crypto-only feeds)
-      Tue–Fri    → All-market overnight recap (last 8 h, all feeds)
+    Two modes:
+      Weekends (Sat/Sun 06:30) → Gold & oil overnight recap using WEEKEND_FEEDS
+      Weekdays (Mon–Fri 06:30) → Full all-market overnight recap using ALL_FEEDS
     """
     print("  Generating morning recap...")
-    zh       = zurich_now()
-    weekday  = zh.weekday()   # 0=Mon … 6=Sun
-    is_monday  = weekday == 0
-    is_weekend = weekday >= 5  # Sat=5, Sun=6
+    zh         = zurich_now()
+    weekday    = zh.weekday()   # 0=Mon … 6=Sun
+    is_weekend = weekday >= 5   # Sat=5, Sun=6
 
     # ── 1. Decide scope ──────────────────────────────────────────────────────
-    _crypto_feeds = [(url, "🪙 CRYPTO") for url in [
-        "https://www.coindesk.com/arc/outbound/rss/",
-        "https://cointelegraph.com/rss",
-        "https://decrypt.co/feed",
-        "https://www.investing.com/rss/news_301.rss",
-        "https://www.theblock.co/rss.xml",
-        "https://blockworks.co/feed",
-    ]]
-
-    if is_monday:
-        # Monday is a double session:
-        #   • Crypto ran all weekend  → 62 h news window, crypto feeds
-        #   • Regular markets opened at 00:00 Zürich → also scan all feeds + all assets
-        # We use ALL_FEEDS with 62 h so both crypto weekend news AND the
-        # early Monday morning market moves are captured in one combined recap.
-        news_hours   = 62
-        feeds_to_use = ALL_FEEDS          # all feeds: catches crypto weekend + early market open
-        crypto_only  = False              # show ALL asset movers (markets opened at midnight)
-        recap_title  = "🌅 *Good morning — Monday Recap (Weekend Crypto + Market Open)*"
-        scope_label  = "Full weekend crypto + markets since 00:00 Zürich"
-    elif is_weekend:
-        news_hours   = 8
-        feeds_to_use = _crypto_feeds
-        crypto_only  = True
-        recap_title  = "🌅 *Good morning — Crypto Overnight Recap*"
-        scope_label  = "Last 8 hours (crypto)"
+    if is_weekend:
+        news_hours   = 10
+        feeds_to_use = WEEKEND_FEEDS
+        recap_title  = "🌅 *Good morning — Gold & Oil Weekend Recap*"
+        scope_label  = "Last 10 hours (gold, oil, global news)"
+        asset_scope  = "gold, crude oil, aluminium futures, S&P 500, and Nasdaq"
     else:
         news_hours   = 8
         feeds_to_use = ALL_FEEDS
-        crypto_only  = False
         recap_title  = "🌅 *Good morning — Overnight Recap*"
         scope_label  = "Last 8 hours (all markets)"
+        asset_scope  = "gold, crude oil, aluminium futures, S&P 500, and Nasdaq"
 
     # ── 2. Read prices from the shared cache populated by main() ─────────────
     # Do NOT call refresh_price_cache() here — main() already called it once
     # before invoking this function. Calling it again would clear the cache,
-    # make ~75 Yahoo Finance requests, hit rate limits, and leave _price_cache
+    # make extra yfinance requests, hit rate limits, and leave _price_cache
     # empty for the signal loop that runs immediately after the recap.
-    symbols_pool = list(CRYPTO_SYMBOLS) if crypto_only else list(ASSET_MAP.keys())
-    top_movers   = []
-    for sym in symbols_pool:
+    top_movers = []
+    for sym in ASSET_MAP.keys():
         d = _price_cache.get(sym)
         if d and d.get("move") is not None:
             top_movers.append((sym, d["move"], d.get("price", "n/a")))
@@ -2929,9 +3121,8 @@ def send_morning_recap(state: dict) -> bool:
 
     mover_lines = []
     for sym, mv, price in top_movers[:10]:
-        arrow  = "📈" if mv > 0 else "📉"
-        prefix = "$" if sym not in FOREX_SYMBOLS else ""
-        mover_lines.append(f"  {arrow} {friendly(sym)}: {mv:+.2f}% | {prefix}{price}")
+        arrow = "📈" if mv > 0 else "📉"
+        mover_lines.append(f"  {arrow} {friendly(sym)}: {mv:+.2f}% | ${price}")
     movers_str = "\n".join(mover_lines) if mover_lines else "  No price data available"
 
     # ── 3. Collect headlines ─────────────────────────────────────────────────
@@ -2965,38 +3156,22 @@ def send_morning_recap(state: dict) -> bool:
                     else f"  No major headlines in the last {news_hours} hours"
 
     # ── 4. Sentiment context ─────────────────────────────────────────────────
-    fg  = fetch_fear_greed()
     vix = _price_cache.get("^VIX")
-    fear_parts = []
-    if fg:
-        fear_parts.append(f"Crypto Fear & Greed: {fg['value']} — {fg['label']}")
-    if vix and vix.get("price") and not crypto_only:
-        fear_parts.append(f"VIX: {vix['price']} ({vix_label(vix['price'])})")
-    fear_str = " | ".join(fear_parts) if fear_parts else "n/a"
+    fear_str = f"VIX: {vix['price']} ({vix_label(vix['price'])})" if vix and vix.get("price") else "n/a"
 
     # ── 5. AI brief ──────────────────────────────────────────────────────────
-    if is_monday:
-        task_prompt = """Monday is a double session — crypto ran all weekend AND traditional markets just opened at midnight. Write a Monday morning brief that covers BOTH. Include:
-1. WEEKEND CRYPTO RECAP: What Bitcoin and Ethereum did over the weekend and why (1-2 sentences)
-2. MARKET OPEN OVERNIGHT: What traditional markets (indices, forex, gold, oil) did since they opened at midnight — any gaps, big moves, or surprises?
-3. TOP 3 SETUPS FOR TODAY: The 3 clearest trade setups right now (can be any asset — crypto or traditional)
-4. KEY LEVELS: One key price level for each of those 3 assets
-5. MAIN RISK: The one macro factor most likely to drive volatility today"""
-        asset_scope = "forex (EUR/USD, GBP/USD), indices (S&P 500, NASDAQ, DAX), gold, oil, and crypto (Bitcoin, Ethereum)"
-    elif is_weekend:
-        task_prompt = """Write a sharp crypto morning brief. Cover:
-1. OVERNIGHT SUMMARY: What moved in crypto and why (1-2 sentences)
-2. TOP 2 CRYPTO SETUPS: Bitcoin and Ethereum — current bias and key level
-3. KEY LEVELS: One support and one resistance for each
-4. MAIN RISK: What could flip the overnight move today"""
-        asset_scope = "Bitcoin and Ethereum"
+    if is_weekend:
+        task_prompt = """Write a sharp weekend brief for a trader watching futures and indices. Cover:
+1. OVERNIGHT SUMMARY: What moved the most in gold, oil, or indices overnight and why (1-2 sentences)
+2. TOP 2 SETUPS: The 2 clearest setups right now (gold or crude oil preferred since they trade on weekends)
+3. KEY LEVELS: One key price level for each setup
+4. MAIN RISK: The one macro or geopolitical factor most likely to drive price today"""
     else:
         task_prompt = """Write a sharp morning brief the trader can read in 60 seconds. Cover:
 1. OVERNIGHT SUMMARY: What moved the most and why (1-2 sentences)
-2. TOP 3 ASSETS TO WATCH TODAY: Which 3 assets have the clearest setup and why
+2. TOP 3 ASSETS TO WATCH TODAY: Which 3 of the 5 assets have the clearest setup and why
 3. KEY LEVELS: For each of those 3 assets, one price level to watch (support or resistance)
 4. MAIN RISK: The one macro factor that could surprise markets today"""
-        asset_scope = "forex (EUR/USD, GBP/USD), indices (S&P 500, NASDAQ, DAX), gold, oil, and crypto"
 
     prompt = f"""You are a senior trading analyst giving a concise morning briefing.
 The trader watches: {asset_scope}.
@@ -3101,7 +3276,7 @@ def main():
 
     # ── MARKET OPEN GATE ─────────────────────────────────────────────────────
     if weekend:
-        print("Weekend mode — running crypto signals only.")
+        print("Weekend mode — monitoring gold, oil, and global news.")
         active_feeds = WEEKEND_FEEDS
     elif not is_market_open():
         print("Market closed — nothing to do.")
