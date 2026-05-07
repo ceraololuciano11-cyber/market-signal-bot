@@ -40,6 +40,7 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CHAT_ID_2: ${{ secrets.CHAT_ID_2 }}
           ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_KEY }}
+          POLYGON_KEY: ${{ secrets.POLYGON_KEY }}
         run: python market_signal_bot.py
 
       # Save the updated state file even if the bot step failed,
