@@ -498,8 +498,8 @@ def signal_confidence(data: dict, bias: str):
             elif bias == "SELL" and of.get("of_bias") == "bearish":
                 score += 1
 
-    # Polygon Level 2 imbalance — institutional order book depth confirms bias
-    l2_imbalance = data.get("l2_imbalance", "")
+    # Polygon Level 2 imbalance — read from order_flow dict (where Polygon stores it)
+    l2_imbalance = of_15.get("l2_imbalance", "") or data.get("l2_imbalance", "")
     if l2_imbalance and bias in ("BUY", "SELL"):
         total += 1
         if bias == "BUY" and "bid" in l2_imbalance.lower():
@@ -507,8 +507,8 @@ def signal_confidence(data: dict, bias: str):
         elif bias == "SELL" and "ask" in l2_imbalance.lower():
             score += 1
 
-    # Polygon trade flow imbalance — % of recent trades on buy side
-    buy_pct = data.get("buy_pct")
+    # Polygon buy-side flow — read from order_flow dict (where Polygon stores it)
+    buy_pct = of_15.get("buy_pct") if of_15 else data.get("buy_pct")
     if buy_pct is not None and bias in ("BUY", "SELL"):
         total += 1
         if bias == "BUY" and buy_pct >= 60:
@@ -1938,7 +1938,8 @@ def _build_tech_block(d: dict, label: str) -> str:
         lines.append(f"  Liq Sweep:  {d['liquidity_sweep']}")
     of = d.get("order_flow") or {}
     if of:
-        lines.append(f"  Delta:      {of['of_bias'].upper()} (cum={of['cum_delta']:+,} | last bar={of['delta']:+,})")
+        _last = f" | last bar={of['delta']:+,}" if "delta" in of else ""
+        lines.append(f"  Delta:      {of['of_bias'].upper()} (cum={of['cum_delta']:+,}{_last})")
         if of.get("delta_flip"):
             lines.append(f"  ⚡ {of['delta_flip']}")
     return "\n".join(lines)
@@ -2497,7 +2498,8 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         fivem_lines.append(f"  ⚡ {primary_data['5m_liquidity_sweep']}")
     of_5m = primary_data.get("5m_order_flow") or {}
     if of_5m:
-        fivem_lines.append(f"  Delta:   {of_5m['of_bias'].upper()} (cum={of_5m['cum_delta']:+,} | last={of_5m['delta']:+,})")
+        _last5 = f" | last={of_5m['delta']:+,}" if "delta" in of_5m else ""
+        fivem_lines.append(f"  Delta:   {of_5m['of_bias'].upper()} (cum={of_5m['cum_delta']:+,}{_last5})")
         if of_5m.get("delta_flip"):
             fivem_lines.append(f"  ⚡ {of_5m['delta_flip']}")
     fivem_section = "🕐 *5-min chart:*\n" + "\n".join(fivem_lines) + "\n\n" if fivem_lines else ""
@@ -2558,7 +2560,8 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         ta_lines.append(f"  ⚡ {primary_data['liquidity_sweep']}")
     of_15 = primary_data.get("order_flow") or {}
     if of_15:
-        ta_lines.append(f"  Delta:      {of_15['of_bias'].upper()} (cum={of_15['cum_delta']:+,} | last={of_15['delta']:+,})")
+        _last15 = f" | last={of_15['delta']:+,}" if "delta" in of_15 else ""
+        ta_lines.append(f"  Delta:      {of_15['of_bias'].upper()} (cum={of_15['cum_delta']:+,}{_last15})")
         if of_15.get("delta_flip"):
             ta_lines.append(f"  ⚡ {of_15['delta_flip']}")
     ta_section = "📈 *Technical (15m):*\n" + "\n".join(ta_lines) + "\n\n" if ta_lines else ""
@@ -2638,7 +2641,8 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
             fh_lines.append(f"  ⚡ {primary_data['4h_liquidity_sweep']}")
         of_4h = primary_data.get("4h_order_flow") or {}
         if of_4h:
-            fh_lines.append(f"  Delta:   {of_4h['of_bias'].upper()} (cum={of_4h['cum_delta']:+,} | last={of_4h['delta']:+,})")
+            _last4h = f" | last={of_4h['delta']:+,}" if "delta" in of_4h else ""
+            fh_lines.append(f"  Delta:   {of_4h['of_bias'].upper()} (cum={of_4h['cum_delta']:+,}{_last4h})")
             if of_4h.get("delta_flip"):
                 fh_lines.append(f"  ⚡ {of_4h['delta_flip']}")
         if fh_lines:
@@ -2733,7 +2737,7 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     # Multi-source
     source_section = ""
     if src_count >= 2:
-        source_section = f"📡 *{src_count} outlets reporting this story*\n\n"
+        source_section = f"🗞 *{src_count} outlets reporting this story*\n\n"
 
     # TradingView chart
     cv_url = chart_url(primary_symbol)
@@ -3186,7 +3190,7 @@ Rules:
 
     # ── 6. Format & send ─────────────────────────────────────────────────────
     cal_line = ""
-    if not is_weekend and not is_monday:
+    if not is_weekend:
         try:
             events = fetch_calendar()
             if events:
