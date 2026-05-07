@@ -1228,166 +1228,148 @@ def calculate_order_flow(opens: list, closes: list, volumes: list,
 
 # ─────────────────────────────
 # POLYGON.IO — REAL ORDER FLOW
-# Supplements the yfinance OHLC-based delta approximation with real trade
-# tape and Level 2 order book data where available.
+# Uses 1-minute aggregate bars from Polygon (available on current plan).
+# Calculates real delta, buy %, POC, VWAP, volume spikes, and delta flips
+# from bar-direction logic (close > open = buy bar, close < open = sell bar).
+#
+# Coverage:
+#   SPY (^GSPC proxy) and QQQ  → real Polygon 1-min bars ✅
+#   GC=F, CL=F, ALI=F (futures) → not on this Polygon plan, yfinance fallback
+#
 # Falls back gracefully to {} on any error or missing POLYGON_KEY.
 # ─────────────────────────────
 
-def _polygon_get(path: str, params: dict = None) -> dict:
-    """Single Polygon REST call. Returns parsed JSON or {} on failure."""
+def _polygon_get_aggs(ticker: str, minutes: int = 300) -> list:
+    """
+    Fetch the last `minutes` worth of 1-minute aggregate bars from Polygon.
+    Returns list of bar dicts (v, vw, o, c, h, l, t, n) or [] on failure.
+    Each bar: v=volume, vw=VWAP, o=open, c=close, h=high, l=low, t=timestamp_ms, n=trades
+    """
     try:
-        url = f"https://api.polygon.io{path}"
-        p   = {"apiKey": POLYGON_KEY}
-        if params:
-            p.update(params)
-        r = requests.get(url, params=p, timeout=10)
+        from datetime import date, timedelta
+        today     = date.today().isoformat()
+        yesterday = (date.today() - timedelta(days=3)).isoformat()  # covers weekends
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{yesterday}/{today}"
+        params = {
+            "adjusted": "true",
+            "sort":     "asc",
+            "limit":    minutes,
+            "apiKey":   POLYGON_KEY,
+        }
+        r = requests.get(url, params=params, timeout=12)
         if r.status_code == 200:
-            return r.json()
+            data = r.json()
+            if data.get("status") == "OK":
+                return data.get("results", [])
     except Exception as e:
-        print(f"  Polygon request error ({path}): {e}")
-    return {}
+        print(f"  Polygon aggs error ({ticker}): {e}")
+    return []
 
 
-def _polygon_real_delta(trades: list) -> dict:
+def _calc_delta_from_bars(bars: list) -> dict:
     """
-    Compute real cumulative delta from Polygon trade tape using the Lee-Ready
-    tick rule:
-      price > prev_price → uptick  → buy volume
-      price < prev_price → downtick → sell volume
-      price = prev_price → use last direction (zero-tick rule)
+    Derive order flow metrics from 1-minute OHLCV bars.
+
+    Bar classification (close-tick rule):
+      close > open  → buying bar   (+volume)
+      close < open  → selling bar  (-volume)
+      close == open → neutral (split evenly)
+
+    Returns: cum_delta, buy_pct, poc, vwap, vol_spike, delta_flip, of_bias
     """
-    if len(trades) < 5:
+    if len(bars) < 10:
         return {}
 
-    # API returns newest-first — reverse to get chronological order
-    chrono = list(reversed(trades))
+    buy_vol = sell_vol = 0.0
+    deltas  = []          # per-bar signed volume
+    price_vol: dict = {}  # vwap → total volume (for POC)
+    total_vol_all = 0.0
+    avg_vol = sum(b["v"] for b in bars) / len(bars)
 
-    deltas     = []
-    last_dir   = 0     # 1=buy, -1=sell
-    prev_price = None
-
-    for t in chrono:
-        price = t.get("price", 0)
-        size  = t.get("size", 0)
-        if prev_price is None:
-            prev_price = price
-            continue
-        if price > prev_price:
-            direction = 1
-        elif price < prev_price:
-            direction = -1
+    for b in bars:
+        v  = b.get("v", 0)
+        o  = b.get("o", 0)
+        c  = b.get("c", 0)
+        vw = round(b.get("vw", c), 2)
+        total_vol_all += v
+        price_vol[vw] = price_vol.get(vw, 0) + v
+        if c > o:
+            deltas.append(v)
+            buy_vol += v
+        elif c < o:
+            deltas.append(-v)
+            sell_vol += v
         else:
-            direction = last_dir
-        deltas.append(direction * size)
-        if direction != 0:
-            last_dir = direction
-        prev_price = price
+            deltas.append(0)
+            buy_vol  += v / 2
+            sell_vol += v / 2
 
-    if not deltas:
-        return {}
+    total_vol = buy_vol + sell_vol
+    cum_delta = round(buy_vol - sell_vol)
+    buy_pct   = round(buy_vol / total_vol * 100) if total_vol > 0 else 50
+    poc       = max(price_vol, key=price_vol.get) if price_vol else None
 
-    cum_delta  = sum(deltas)
-    last_delta = deltas[-1]
+    # VWAP from last bar (Polygon provides per-bar VWAP)
+    vwap = bars[-1].get("vw") if bars else None
 
+    # Volume spike — last bar vs average
+    last_vol   = bars[-1].get("v", 0) if bars else 0
+    vol_spike  = round(last_vol / avg_vol, 1) if avg_vol > 0 else 1.0
+
+    # Delta flip — did direction change in last 6 bars?
     flip = ""
     if len(deltas) >= 6:
         recent = sum(deltas[-3:])
         prior  = sum(deltas[-6:-3])
         if prior < 0 and recent > 0:
-            flip = "Bullish delta flip — sellers exhausted, buyers taking over"
+            flip = "Bullish delta flip — sellers exhausted, buyers stepping in"
         elif prior > 0 and recent < 0:
-            flip = "Bearish delta flip — buyers exhausted, sellers taking over"
+            flip = "Bearish delta flip — buyers exhausted, sellers pressing"
 
-    # Trade flow imbalance — % of last 100 trades on buy side
-    last_100   = deltas[-100:] if len(deltas) >= 100 else deltas
-    buy_vol    = sum(d for d in last_100 if d > 0)
-    sell_vol   = sum(abs(d) for d in last_100 if d < 0)
-    total_vol  = buy_vol + sell_vol
-    buy_pct    = round(buy_vol / total_vol * 100) if total_vol > 0 else 50
+    # Consecutive bar streak (momentum)
+    streak = 0
+    streak_dir = None
+    for d in reversed(deltas):
+        if d > 0:
+            if streak_dir in (None, "buy"):
+                streak += 1; streak_dir = "buy"
+            else: break
+        elif d < 0:
+            if streak_dir in (None, "sell"):
+                streak += 1; streak_dir = "sell"
+            else: break
+        else:
+            break
 
-    # Point of Control — most traded price level in last 300 trades
-    price_vols: dict = {}
-    for t in chrono[-300:]:
-        p = round(t.get("price", 0), 2)
-        s = t.get("size", 0)
-        price_vols[p] = price_vols.get(p, 0) + s
-    poc = max(price_vols, key=price_vols.get) if price_vols else None
+    streak_str = ""
+    if streak >= 3 and streak_dir:
+        streak_str = f"{streak} consecutive {'buying' if streak_dir == 'buy' else 'selling'} bars"
 
     bias = "bullish" if cum_delta > 0 else "bearish" if cum_delta < 0 else "neutral"
 
     return {
-        "delta":       round(last_delta),
-        "cum_delta":   round(cum_delta),
-        "delta_flip":  flip,
-        "of_bias":     bias,
+        "cum_delta":   cum_delta,
         "buy_pct":     buy_pct,
         "poc":         poc,
+        "vwap":        round(vwap, 2) if vwap else None,
+        "vol_spike":   vol_spike,
+        "delta_flip":  flip,
+        "bar_streak":  streak_str,
+        "of_bias":     bias,
         "data_source": "polygon_real",
-    }
-
-
-def _polygon_l2_imbalances(book: dict) -> dict:
-    """
-    Compute bid/ask imbalances from Polygon Level 2 snapshot.
-    Stacked imbalance: 3+ consecutive levels where one side is 5x+ the other.
-    """
-    bids = book.get("bids", [])
-    asks = book.get("asks", [])
-    if not bids or not asks:
-        return {}
-
-    # Total depth — top 10 levels each side
-    bid_depth = sum(b.get("s", b.get("size", 0)) for b in bids[:10])
-    ask_depth = sum(a.get("s", a.get("size", 0)) for a in asks[:10])
-    total     = bid_depth + ask_depth
-    if total == 0:
-        return {}
-
-    bid_pct = round(bid_depth / total * 100)
-
-    # Stacked imbalance detection
-    bid_imb = ask_imb = 0
-    for i in range(min(len(bids), len(asks), 10)):
-        bs = bids[i].get("s", bids[i].get("size", 0))
-        as_ = asks[i].get("s", asks[i].get("size", 0))
-        if bs > 0 and as_ > 0:
-            if bs / as_ >= 5:
-                bid_imb += 1
-            elif as_ / bs >= 5:
-                ask_imb += 1
-
-    imbalance_signal = ""
-    if bid_imb >= 3:
-        imbalance_signal = f"Stacked bid imbalance ({bid_imb} levels) — institutional buying interest"
-    elif ask_imb >= 3:
-        imbalance_signal = f"Stacked ask imbalance ({ask_imb} levels) — institutional selling interest"
-
-    absorption = ""
-    if bid_pct >= 70:
-        absorption = "Strong bid absorption — large buyer defending price"
-    elif bid_pct <= 30:
-        absorption = "Strong ask absorption — large seller capping price"
-
-    return {
-        "bid_pct":       bid_pct,
-        "l2_imbalance":  imbalance_signal,
-        "l2_absorption": absorption,
     }
 
 
 def fetch_polygon_order_flow(symbol: str) -> dict:
     """
-    Fetch real order flow from Polygon.io for a given yfinance symbol.
+    Fetch real order flow from Polygon.io using 1-minute aggregate bars.
 
-    Stocks (SPY proxy for ^GSPC, QQQ):
-        — Trade tape via /v3/trades  → real delta (Lee-Ready tick rule)
-        — Level 2 snapshot           → stacked imbalances, absorption
-    Futures (CL, GC, ALI):
-        — Trade tape via /v3/trades  → real delta
-        — Level 2 not available on most futures tiers
+    Available on current plan:
+      SPY (proxy for ^GSPC) and QQQ → 1-min bars → full delta/POC/VWAP metrics
+      GC=F / CL=F / ALI=F           → Polygon plan doesn't include NYMEX futures
+                                       → returns {} → yfinance approximation used
 
-    Falls back gracefully to {} if POLYGON_KEY is missing, symbol is not
-    mapped, or any API call fails.
+    Falls back gracefully to {} on any failure.
     """
     if not POLYGON_KEY:
         return {}
@@ -1395,41 +1377,15 @@ def fetch_polygon_order_flow(symbol: str) -> dict:
     if not poly_sym:
         return {}
 
+    # Only stocks are available on this Polygon plan
+    if symbol not in ("^GSPC", "QQQ"):
+        return {}
+
     try:
-        is_stock  = symbol in ("^GSPC", "QQQ")
-        is_future = symbol in ("CL=F", "GC=F", "ALI=F")
-
-        # ── Trade tape ────────────────────────────────────────────────────────
-        trades_data = _polygon_get(f"/v3/trades/{poly_sym}",
-                                   {"order": "desc", "limit": 500})
-        trades = trades_data.get("results", [])
-        if not trades:
-            # Futures may need a different path prefix
-            if is_future:
-                trades_data = _polygon_get(f"/v3/trades/I:{poly_sym}",
-                                           {"order": "desc", "limit": 500})
-                trades = trades_data.get("results", [])
-        if not trades:
+        bars = _polygon_get_aggs(poly_sym, minutes=300)
+        if not bars:
             return {}
-
-        result = _polygon_real_delta(trades)
-        if not result:
-            return {}
-
-        # ── Level 2 (stocks only — Developer plan) ───────────────────────────
-        if is_stock:
-            try:
-                book_data = _polygon_get(
-                    f"/v2/snapshot/locale/us/markets/stocks/tickers/{poly_sym}/book"
-                )
-                book = book_data.get("data", book_data.get("results", {}))
-                if book:
-                    result.update(_polygon_l2_imbalances(book))
-            except Exception:
-                pass  # L2 optional — don't fail if not available on this plan
-
-        return result
-
+        return _calc_delta_from_bars(bars)
     except Exception as e:
         print(f"  Polygon order flow error ({symbol}): {e}")
         return {}
@@ -2072,21 +2028,27 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
         parts = []
         delta = poly_flow.get("cum_delta")
         if delta is not None:
-            parts.append(f"Real cumulative delta: {delta:+,.0f}")
+            parts.append(f"Cumulative delta (1-min bars): {delta:+,.0f} ({'bullish' if delta > 0 else 'bearish'} flow)")
         buy_pct = poly_flow.get("buy_pct")
         if buy_pct is not None:
-            parts.append(f"Buy-side flow: {buy_pct}%")
+            parts.append(f"Buy-side pressure: {buy_pct}% ({'buyers dominant' if buy_pct >= 55 else 'sellers dominant' if buy_pct <= 45 else 'balanced'})")
         poc = poly_flow.get("poc")
         if poc is not None:
-            parts.append(f"Point of control: {poc}")
-        l2 = poly_flow.get("l2_imbalance")
-        if l2:
-            parts.append(f"L2 imbalance: {l2}")
-        absorption = poly_flow.get("l2_absorption")
-        if absorption:
-            parts.append(f"Absorption: {absorption}")
+            parts.append(f"Point of Control (most-traded price): {poc}")
+        vwap = poly_flow.get("vwap")
+        if vwap is not None:
+            parts.append(f"VWAP: {vwap}")
+        vol_spike = poly_flow.get("vol_spike")
+        if vol_spike and vol_spike >= 1.5:
+            parts.append(f"Volume spike: {vol_spike}x average — elevated participation")
+        flip = poly_flow.get("delta_flip")
+        if flip:
+            parts.append(f"Delta flip detected: {flip}")
+        streak = poly_flow.get("bar_streak")
+        if streak:
+            parts.append(f"Bar momentum: {streak}")
         if parts:
-            polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon) ━━━\n" + "\n".join(parts)
+            polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon 1-min bars) ━━━\n" + "\n".join(parts)
 
     prim_name = friendly(primary_symbol) if primary_symbol else "the most affected asset"
     prim_price = primary_data.get("price", "n/a")
@@ -2728,28 +2690,35 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
             f" | {dxy.get('trend', 'n/a')}\n\n"
         )
 
-    # Polygon real order flow section (only if real data available)
+    # Polygon real order flow section (only when real data available — SPY/QQQ)
     poly_section = ""
     poly_flow = primary_data.get("polygon_flow") or primary_data.get("order_flow") or {}
     if poly_flow.get("data_source") == "polygon_real":
-        poly_lines = ["📡 *Real Order Flow (Polygon):*"]
+        poly_lines = ["📡 *Real Order Flow (Polygon 1-min bars):*"]
         delta = poly_flow.get("cum_delta")
         if delta is not None:
-            delta_sign = "+" if delta >= 0 else ""
-            poly_lines.append(f"  Delta: {delta_sign}{delta:,.0f} 🟢 REAL DATA")
+            d_sign = "+" if delta >= 0 else ""
+            bias_emoji = "🟢" if delta > 0 else "🔴" if delta < 0 else "⚪"
+            poly_lines.append(f"  {bias_emoji} Cum Delta: {d_sign}{delta:,.0f}")
         buy_pct = poly_flow.get("buy_pct")
         if buy_pct is not None:
-            side = "Buy" if buy_pct >= 50 else "Sell"
-            poly_lines.append(f"  Flow: {buy_pct}% {side}-side pressure")
+            bar = "█" * (buy_pct // 10) + "░" * (10 - buy_pct // 10)
+            poly_lines.append(f"  Flow: {buy_pct}% buy  |{bar}|")
+        vwap = poly_flow.get("vwap")
+        if vwap is not None:
+            poly_lines.append(f"  VWAP: {vwap}")
         poc = poly_flow.get("poc")
         if poc is not None:
-            poly_lines.append(f"  POC: {poc} (most traded price)")
-        l2 = poly_flow.get("l2_imbalance")
-        if l2:
-            poly_lines.append(f"  L2: {l2}")
-        absorption = poly_flow.get("l2_absorption")
-        if absorption:
-            poly_lines.append(f"  Absorption: {absorption}")
+            poly_lines.append(f"  POC:  {poc} (most traded price)")
+        vol_spike = poly_flow.get("vol_spike")
+        if vol_spike and vol_spike >= 1.5:
+            poly_lines.append(f"  Vol:  {vol_spike}x average ⚡ spike")
+        flip = poly_flow.get("delta_flip")
+        if flip:
+            poly_lines.append(f"  ⚡ {flip}")
+        streak = poly_flow.get("bar_streak")
+        if streak:
+            poly_lines.append(f"  📊 {streak}")
         poly_section = "\n".join(poly_lines) + "\n\n"
 
     # Multi-source
