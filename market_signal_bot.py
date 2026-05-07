@@ -1239,17 +1239,24 @@ def calculate_order_flow(opens: list, closes: list, volumes: list,
 # Falls back gracefully to {} on any error or missing POLYGON_KEY.
 # ─────────────────────────────
 
-def _polygon_get_aggs(ticker: str, minutes: int = 300) -> list:
+def _massive_get_aggs(ticker: str, minutes: int = 300) -> list:
     """
-    Fetch the last `minutes` worth of 1-minute aggregate bars from Polygon.
+    Fetch the last `minutes` worth of 1-minute aggregate bars from api.massive.com.
     Returns list of bar dicts (v, vw, o, c, h, l, t, n) or [] on failure.
     Each bar: v=volume, vw=VWAP, o=open, c=close, h=high, l=low, t=timestamp_ms, n=trades
+
+    Confirmed working on current plan:
+      CL  (Crude Oil futures)  ✅
+      SPY (S&P 500 ETF)       ✅
+      QQQ (Nasdaq 100 ETF)    ✅
+      GC  (Gold futures)      ❌ — NOT_FOUND on Massive, yfinance fallback used
+      ALI (Aluminium futures) ❌ — NOT_FOUND on Massive, yfinance fallback used
     """
     try:
         from datetime import date, timedelta
         today     = date.today().isoformat()
-        yesterday = (date.today() - timedelta(days=3)).isoformat()  # covers weekends
-        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{yesterday}/{today}"
+        from_date = (date.today() - timedelta(days=3)).isoformat()  # covers weekends
+        url = f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/minute/{from_date}/{today}"
         params = {
             "adjusted": "true",
             "sort":     "asc",
@@ -1262,7 +1269,7 @@ def _polygon_get_aggs(ticker: str, minutes: int = 300) -> list:
             if data.get("status") == "OK":
                 return data.get("results", [])
     except Exception as e:
-        print(f"  Polygon aggs error ({ticker}): {e}")
+        print(f"  Massive aggs error ({ticker}): {e}")
     return []
 
 
@@ -1362,12 +1369,14 @@ def _calc_delta_from_bars(bars: list) -> dict:
 
 def fetch_polygon_order_flow(symbol: str) -> dict:
     """
-    Fetch real order flow from Polygon.io using 1-minute aggregate bars.
+    Fetch real order flow from api.massive.com using 1-minute aggregate bars.
 
-    Available on current plan:
-      SPY (proxy for ^GSPC) and QQQ → 1-min bars → full delta/POC/VWAP metrics
-      GC=F / CL=F / ALI=F           → Polygon plan doesn't include NYMEX futures
-                                       → returns {} → yfinance approximation used
+    Confirmed working on Futures Developer plan:
+      ^GSPC → SPY  1-min bars ✅  (Stocks Basic free plan via Massive)
+      QQQ   → QQQ  1-min bars ✅
+      CL=F  → CL   1-min bars ✅  (Futures Developer plan — real crude oil data)
+      GC=F  → GC   NOT_FOUND  ❌  → returns {} → yfinance approximation
+      ALI=F → ALI  NOT_FOUND  ❌  → returns {} → yfinance approximation
 
     Falls back gracefully to {} on any failure.
     """
@@ -1377,17 +1386,17 @@ def fetch_polygon_order_flow(symbol: str) -> dict:
     if not poly_sym:
         return {}
 
-    # Only stocks are available on this Polygon plan
-    if symbol not in ("^GSPC", "QQQ"):
+    # Only confirmed-working tickers — GC and ALI not available on this plan
+    if symbol not in ("^GSPC", "QQQ", "CL=F"):
         return {}
 
     try:
-        bars = _polygon_get_aggs(poly_sym, minutes=300)
+        bars = _massive_get_aggs(poly_sym, minutes=300)
         if not bars:
             return {}
         return _calc_delta_from_bars(bars)
     except Exception as e:
-        print(f"  Polygon order flow error ({symbol}): {e}")
+        print(f"  Massive order flow error ({symbol}): {e}")
         return {}
 
 def detect_market_structure(highs: list, lows: list, closes: list,
