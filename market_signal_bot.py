@@ -2561,135 +2561,153 @@ def is_at_trap_level(bias: str, primary_data: dict, threshold_pct: float = 0.4) 
 # TRADE LEVELS (programmatic — anchored to support/resistance)
 # ─────────────────────────────
 def compute_trade_levels(bias: str, primary_data: dict) -> dict:
-    """Compute Entry/SL/TP from price + 15m and daily support/resistance.
+    """Compute Entry/SL/TP using full Polygon + yfinance confluence.
 
-    AI-generated levels frequently violated the bot's own technical levels
-    (e.g. SELL stop placed below resistance, BUY target placed beyond
-    resistance with no breakout logic, target inside the support zone we'd
-    expect to hold). This function replaces those with rule-based levels
-    that always respect S/R:
+    Level sources (all used simultaneously):
+      Polygon real data  : VPOC, VAH, VAL, VWAP, swing S/R, session H/L, OR H/L
+      yfinance 15m       : support, resistance
+      yfinance daily     : daily_support, daily_resistance
+      volatility         : ATR for buffer sizing
 
-      - Entry: tight ±0.15% range around current price.
-      - BUY  SL: just below 15m support (0.15% buffer); falls back to daily
-        support, else a 1% safety stop.
-      - SELL SL: just above 15m resistance (0.15% buffer); falls back to
-        daily resistance, else a 1% safety stop.
-      - TP1 (conservative): the nearest S/R giving at least 1R reward,
-        otherwise a 1.5R extension.
-      - TP2 (aggressive): a 2.5R extension capped at 3.5R; or daily S/R
-        if it sits between TP1 and the cap.
-      - Always enforces SL on the loss side, TP on the profit side, and
-        formats decimals based on price magnitude.
+    BUY logic:
+      Entry  : tight band around current price (±0.15%)
+      SL     : highest support meaningfully below price — prioritises real
+               Polygon levels (VAL, swing support, VWAP breakdown) over yfinance;
+               closest valid level = tightest stop = best R/R
+      TP1    : nearest upside confluence ≥1R away, priority order:
+               VPOC (price magnet) → VWAP (mean-reversion target) → VAH
+               → OR high → 15m resistance → Polygon swing resistance
+               → daily resistance → session high
+      TP2    : next confluence level above TP1, or 2.5R extension
 
+    SELL logic: mirror of BUY.
+
+    Always enforces SL on loss side, TP on profit side, R:R ≥ 1:1.
     Returns {} if bias is non-directional or price is missing.
     """
     price = primary_data.get("price")
     if not price or price <= 0 or bias not in ("BUY", "SELL"):
         return {}
 
+    # ── yfinance levels ──────────────────────────────────────────────────────
     s15 = primary_data.get("support")
     r15 = primary_data.get("resistance")
     sd  = primary_data.get("daily_support")
     rd  = primary_data.get("daily_resistance")
     atr = primary_data.get("atr")
 
-    # ATR-aware buffer: at least 0.15% of price, but scales up with volatility
-    # (half an ATR) so stops aren't too tight in fast-moving markets.
+    # ── Polygon real levels ──────────────────────────────────────────────────
+    poly  = primary_data.get("polygon_flow") or {}
+    vpoc  = poly.get("vpoc")           # most-traded price — strongest magnet
+    vah   = poly.get("vah")            # value area high — institutional resistance
+    val   = poly.get("val")            # value area low  — institutional support
+    vwap  = poly.get("vwap")           # session VWAP — dynamic S/R and mean target
+    p_res = poly.get("key_resistance") # Polygon swing high resistance
+    p_sup = poly.get("key_support")    # Polygon swing low support
+    s_hi  = poly.get("session_high")   # session ceiling
+    s_lo  = poly.get("session_low")    # session floor
+    or_hi = poly.get("or_high")        # opening range high (15-min)
+    or_lo = poly.get("or_low")         # opening range low  (15-min)
+
+    # ── ATR-aware buffer ─────────────────────────────────────────────────────
+    # At least 0.15% of price, scales with volatility so stops breathe in
+    # fast-moving markets (futures, volatile ETFs) without being reckless.
     buf = max(price * 0.0015, (atr * 0.5) if atr else 0)
 
-    # Decimal precision based on price magnitude
+    # ── Decimal precision ─────────────────────────────────────────────────────
     if   price >= 1000: dec = 1
     elif price >= 10:   dec = 2
     elif price >= 1:    dec = 4
     else:               dec = 5
     fmt = lambda n: f"{n:.{dec}f}"
 
+    # ── Helper: filter levels to a valid band ────────────────────────────────
+    def _below(lvl, min_gap=0.002):
+        """Level is meaningfully below price (at least min_gap %)."""
+        return lvl is not None and lvl < price * (1 - min_gap)
+
+    def _above(lvl, min_gap=0.002):
+        """Level is meaningfully above price (at least min_gap %)."""
+        return lvl is not None and lvl > price * (1 + min_gap)
+
+    # ════════════════════════════════════════════════════════════════════════
     if bias == "BUY":
         entry_lo = price * 0.999
         entry_hi = price * 1.0015
 
-        # SL: below support (must be below current price)
-        if s15 and s15 < price * 0.998:
-            sl = s15 - buf
-        elif sd and sd < price * 0.99:
-            sl = sd - buf
-        else:
-            sl = price * 0.99  # 1% safety stop
+        # ── SL: best support below price (take HIGHEST = tightest valid stop)
+        # Priority: VAL > Polygon swing > VWAP breakdown > 15m S/R > daily S/R
+        sl_pool = [
+            lvl for lvl in [val, p_sup, vwap, or_lo, s15, sd]
+            if _below(lvl)
+        ]
+        sl = (max(sl_pool) - buf) if sl_pool else (price * 0.99)
 
         risk = price - sl
         if risk <= 0:
-            sl = price * 0.99
+            sl   = price * 0.99
             risk = price - sl
 
-        min_tp = price + risk * 1.0   # any TP must be at least 1R
-        max_tp = price + risk * 3.5   # cap on far target
+        min_tp = price + risk          # floor: 1:1 minimum
+        max_tp = price + risk * 4.0    # ceiling: 4R cap
 
-        # TP1: nearest meaningful resistance giving 1R+, else 1.5R extension
-        tp1_candidates = []
-        if r15 and (r15 - buf) >= min_tp:
-            tp1_candidates.append(r15 - buf)
-        if rd and (rd - buf) >= min_tp and (rd - buf) <= max_tp:
-            tp1_candidates.append(rd - buf)
-        tp1 = min(tp1_candidates) if tp1_candidates else (price + risk * 1.5)
+        # ── TP pool: Polygon levels first (magnets), then yfinance S/R ───────
+        # Applied with small buf so we don't target right at a level (fill risk)
+        tp_pool = sorted(
+            [lvl - buf for lvl in [vpoc, vwap, vah, or_hi, r15, p_res, rd, s_hi]
+             if lvl is not None and (lvl - buf) >= min_tp and (lvl - buf) <= max_tp],
+        )
 
-        # TP2: 2.5R extension, or daily resistance if between TP1 and cap
-        tp2 = price + risk * 2.5
-        if rd and (rd - buf) > tp1 and (rd - buf) <= max_tp:
-            tp2 = max(tp2, rd - buf)
-        tp2 = min(tp2, max_tp)
+        tp1 = tp_pool[0] if tp_pool else (price + risk * 1.5)
+        # TP2: next level in pool above TP1, else 2.5R extension
+        tp2_pool = [t for t in tp_pool if t > tp1 * 1.003]
+        tp2      = tp2_pool[0] if tp2_pool else min(price + risk * 2.5, max_tp)
 
-        if tp2 > tp1 * 1.003:  # ranges only when meaningfully apart
+        if tp2 > tp1 * 1.003:
             target = f"{fmt(tp1)}-{fmt(tp2)}"
         else:
             target = fmt(tp1)
 
-        return {
-            "entry":  f"{fmt(entry_lo)}-{fmt(entry_hi)}",
-            "stop":   fmt(sl),
-            "target": target,
-        }
+        return {"entry": f"{fmt(entry_lo)}-{fmt(entry_hi)}", "stop": fmt(sl), "target": target}
 
+    # ════════════════════════════════════════════════════════════════════════
     # SELL
     entry_lo = price * 0.9985
     entry_hi = price * 1.001
 
-    if r15 and r15 > price * 1.002:
-        sl = r15 + buf
-    elif rd and rd > price * 1.01:
-        sl = rd + buf
-    else:
-        sl = price * 1.01
+    # ── SL: best resistance above price (take LOWEST = tightest valid stop)
+    # Priority: VAH > Polygon swing > VWAP reclaim > 15m S/R > daily S/R
+    sl_pool = [
+        lvl for lvl in [vah, p_res, vwap, or_hi, r15, rd]
+        if _above(lvl)
+    ]
+    sl = (min(sl_pool) + buf) if sl_pool else (price * 1.01)
 
     risk = sl - price
     if risk <= 0:
-        sl = price * 1.01
+        sl   = price * 1.01
         risk = sl - price
 
-    min_tp = price - risk * 1.0   # any TP must be at least 1R below
-    max_tp = price - risk * 3.5   # furthest TP allowed
+    min_tp = price - risk          # floor: 1:1 minimum (going down)
+    max_tp = price - risk * 4.0    # ceiling: 4R cap (going down)
 
-    tp1_candidates = []
-    if s15 and (s15 + buf) <= min_tp:
-        tp1_candidates.append(s15 + buf)
-    if sd and (sd + buf) <= min_tp and (sd + buf) >= max_tp:
-        tp1_candidates.append(sd + buf)
-    tp1 = max(tp1_candidates) if tp1_candidates else (price - risk * 1.5)
+    # ── TP pool: Polygon levels first, then yfinance S/R ─────────────────────
+    tp_pool = sorted(
+        [lvl + buf for lvl in [vpoc, vwap, val, or_lo, s15, p_sup, sd, s_lo]
+         if lvl is not None and (lvl + buf) <= min_tp and (lvl + buf) >= max_tp],
+        reverse=True,   # highest first = nearest to price for SELL
+    )
 
-    tp2 = price - risk * 2.5
-    if sd and (sd + buf) < tp1 and (sd + buf) >= max_tp:
-        tp2 = min(tp2, sd + buf)
-    tp2 = max(tp2, max_tp)
+    tp1 = tp_pool[0] if tp_pool else (price - risk * 1.5)
+    tp2_pool = [t for t in tp_pool if t < tp1 * 0.997]
+    tp2      = tp2_pool[0] if tp2_pool else max(price - risk * 2.5, max_tp)
 
     if tp1 > tp2 * 1.003:
-        target = f"{fmt(tp2)}-{fmt(tp1)}"  # smaller-larger reads naturally
+        target = f"{fmt(tp2)}-{fmt(tp1)}"   # show lower-higher (natural reading)
     else:
         target = fmt(tp1)
 
-    return {
-        "entry":  f"{fmt(entry_lo)}-{fmt(entry_hi)}",
-        "stop":   fmt(sl),
-        "target": target,
-    }
+    return {"entry": f"{fmt(entry_lo)}-{fmt(entry_hi)}", "stop": fmt(sl), "target": target}
 
 # ─────────────────────────────
 # FORMAT MESSAGE
