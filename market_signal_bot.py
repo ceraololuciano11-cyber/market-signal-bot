@@ -2115,12 +2115,25 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
             delta_bonus = 8
             break
 
-    # Polygon real data bonus — real tick-classified delta is more reliable
-    # than the yfinance OHLC approximation; small boost for confirmed signals
+    # Polygon order flow quality bonus — scales with how strong the real
+    # data signal is, not just whether Polygon responded at all.
     polygon_bonus = 0
     for d in moves.values():
-        if d.get("polygon_flow", {}).get("data_source") == "polygon_real":
-            polygon_bonus = 5
+        pf = d.get("polygon_flow") or {}
+        if pf.get("data_source") == "polygon_real":
+            polygon_bonus = 5                                          # base: real data present
+            if pf.get("of_bias") in ("bullish", "bearish"):
+                polygon_bonus += 3                                     # clear directional delta
+            bp = pf.get("buy_pct") or 50
+            if bp >= 65 or bp <= 35:
+                polygon_bonus += 3                                     # strong buy/sell pressure
+            if pf.get("imbalance"):
+                polygon_bonus += 3                                     # bars dominated one side
+            if pf.get("block_trade"):
+                polygon_bonus += 4                                     # institutional footprint
+            if (pf.get("vol_spike") or 1.0) >= 2.0:
+                polygon_bonus += 3                                     # volume confirmation
+            polygon_bonus = min(polygon_bonus, 20)                    # cap at 20
             break
 
     total = min(100, freshness + macro_bonus + energy_bonus
@@ -3011,6 +3024,18 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     conf_bar     = confidence_bar(conf_score, conf_total)
     # Only show confidence for directional signals — WATCH/NEUTRAL always score 0 which is misleading
     conf_section = f"💪 *Confidence: {conf_score}/{conf_total} indicators aligned* |{conf_bar}|\n\n" if (conf_total > 0 and bias in ("BUY", "SELL")) else ""
+
+    # ── Confidence bonus → final_score ───────────────────────────────────────
+    # The 15-indicator system now directly affects signal strength, not just
+    # display. Higher alignment = stronger signal = higher label.
+    #   ≥70% aligned → +10 (HIGH CONVICTION boost)
+    #   ≥55% aligned → +6
+    #   ≥40% aligned → +3
+    #   <40% aligned → +0 (signal still passed the gate at 35%, just no boost)
+    if conf_total >= 5 and bias in ("BUY", "SELL"):
+        conf_ratio = conf_score / conf_total
+        conf_boost = 10 if conf_ratio >= 0.70 else 6 if conf_ratio >= 0.55 else 3 if conf_ratio >= 0.40 else 0
+        final_score = min(100, final_score + conf_boost)
 
     # Streak — only displayed when current bias extends an existing streak
     streak_section = get_streak_label(state, primary_symbol, bias)
