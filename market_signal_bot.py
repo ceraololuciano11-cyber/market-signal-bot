@@ -96,6 +96,9 @@ ALL_FEEDS = (
 # ─────────────────────────────
 ASSET_MAP = {
     "GC=F":  ["gold", "xau", "bullion", "precious metal"],
+    "SI=F":  ["silver", "xag", "silver futures", "silver price", "comex silver"],
+    "HG=F":  ["copper", "hg", "comex copper", "copper price", "copper futures",
+              "copper supply", "copper demand", "copper mine", "freeport", "southern copper"],
     "ALI=F": ["aluminium", "aluminum", "alcoa", "bauxite", "rusal", "aluminium smelter",
               "aluminum smelter", "norsk hydro", "hindalco", "aluminium tariff",
               "aluminum tariff", "aluminium supply", "aluminum supply"],
@@ -106,6 +109,8 @@ ASSET_MAP = {
 
 ASSET_NAMES = {
     "GC=F":  "Gold (XAU/USD)",
+    "SI=F":  "Silver (XAG/USD)",
+    "HG=F":  "Copper Futures (HG)",
     "ALI=F": "Aluminium Futures",
     "CL=F":  "Crude Oil (WTI)",
     "^GSPC": "S&P 500",
@@ -130,9 +135,11 @@ FOREX_SYMBOLS:  set = set()
 POLYGON_SYMBOLS = {
     "^GSPC": "SPY",    # S&P 500 → SPDR S&P 500 ETF (direct proxy)
     "QQQ":   "QQQ",    # Nasdaq 100 ETF (direct)
-    "CL=F":  "CL",     # Crude Oil → NYMEX continuous futures (real futures data)
-    "GC=F":  "GLD",    # Gold → SPDR Gold ETF (tracks gold 1:1; GC futures not in plan)
-    "ALI=F": "DBB",    # Aluminium → Invesco DB Base Metals ETF (33% alu; ALI not in plan)
+    "CL=F":  "CL",     # Crude Oil → NYMEX continuous futures (real futures data) ✅
+    "GC=F":  "GLD",    # Gold → SPDR Gold ETF (tracks gold 1:1; GC futures not in plan) ✅
+    "SI=F":  "SI",     # Silver → COMEX continuous futures (confirmed real data) ✅
+    "HG=F":  "HG",     # Copper → COMEX continuous futures (confirmed real data) ✅
+    "ALI=F": "DBB",    # Aluminium → Invesco DB Base Metals ETF (33% alu; ALI not in plan) ✅
 }
 
 def friendly(symbol: str) -> str:
@@ -146,6 +153,8 @@ KEYWORDS = [
     "rate hike", "rate cut", "nfp", "jobs report",
     "gdp", "recession", "powell", "treasury", "yield", "dollar", "dxy",
     "gold", "xau", "bullion", "precious metal",
+    "silver", "xag", "comex silver",
+    "copper", "comex copper", "freeport", "southern copper", "copper mine",
     "aluminium", "aluminum", "alcoa", "bauxite", "rusal", "norsk hydro", "hindalco",
     "oil", "crude", "wti", "brent", "opec", "petroleum", "energy",
     "natural gas", "lng", "pipeline",
@@ -564,6 +573,8 @@ def count_sources(title: str, story_counts: dict) -> int:
 # ─────────────────────────────
 TRADINGVIEW_SYMBOLS = {
     "GC=F":  "COMEX:GC1!",
+    "SI=F":  "COMEX:SI1!",
+    "HG=F":  "COMEX:HG1!",
     "ALI=F": "COMEX:ALI1!",
     "CL=F":  "NYMEX:CL1!",
     "^GSPC": "SP:SPX",
@@ -1446,6 +1457,34 @@ def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
     last_vol  = bar_data[-1]["v"]
     vol_spike = round(last_vol / avg_vol, 1) if avg_vol > 0 else 1.0
 
+    # ── Block trade detection (using Polygon 'n' field = trades per bar) ─────
+    # A block trade bar has very few large individual transactions:
+    # high volume but low trade count → average trade size is abnormally large.
+    # Threshold: avg_trade_size >= 5× the session average trade size.
+    block_trades: list = []
+    n_values = [b.get("n") or 0 for b in bars if b.get("n")]
+    if n_values:
+        avg_n    = sum(n_values) / len(n_values)
+        avg_size = (total_vol_all / sum(n_values)) if sum(n_values) > 0 else 0
+        for b in bars[-20:]:   # scan last 20 bars for recency
+            bv = b.get("v") or 0
+            bn = b.get("n") or 0
+            if bn > 0 and bv > 0:
+                bar_avg_size = bv / bn
+                if bar_avg_size >= avg_size * 5 and bv >= avg_vol * 1.5:
+                    direction = "buy" if (b.get("c", 0) >= b.get("o", 0)) else "sell"
+                    block_trades.append(direction)
+    block_trade_signal = ""
+    if block_trades:
+        buy_blk  = block_trades.count("buy")
+        sell_blk = block_trades.count("sell")
+        if buy_blk > sell_blk:
+            block_trade_signal = f"🐳 Block buy prints detected ({buy_blk} bars) — institutional accumulation"
+        elif sell_blk > buy_blk:
+            block_trade_signal = f"🐳 Block sell prints detected ({sell_blk} bars) — institutional distribution"
+        else:
+            block_trade_signal = f"🐳 Block prints detected ({len(block_trades)} bars) — large player activity"
+
     # ── Market structure from swing highs/lows (last 30 bars) ────────────────
     window    = bar_data[-30:] if len(bar_data) >= 30 else bar_data
     swg_highs: list = []
@@ -1486,6 +1525,7 @@ def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
         "imbalance":       imbalance,
         "bar_streak":      bar_streak,
         "vol_spike":       vol_spike,
+        "block_trade":     block_trade_signal,
         # Structure
         "mkt_structure":   mkt_structure,
         "key_resistance":  key_resistance,
@@ -1523,8 +1563,12 @@ def fetch_polygon_order_flow(symbol: str) -> dict:
     }
     proxy_note = proxy_notes.get(symbol, "")
 
+    # SPY/QQQ: use full trading session window (390 min = 6.5 h) for richer
+    # volume profile and market structure vs. 300 min for futures.
+    bar_minutes = 390 if symbol in ("^GSPC", "QQQ") else 300
+
     try:
-        bars = _massive_get_aggs(poly_sym, minutes=300)
+        bars = _massive_get_aggs(poly_sym, minutes=bar_minutes)
         if not bars:
             print(f"  Massive: no bars returned for {poly_sym} ({symbol})")
             return {}
@@ -1942,6 +1986,8 @@ def get_primary_symbol(title: str, moves: dict) -> str:
 ENERGY_KEYWORDS = [
     "oil", "crude", "wti", "brent", "opec", "petroleum", "energy",
     "gold", "xau", "bullion", "precious metal",
+    "silver", "xag", "comex silver",
+    "copper", "comex copper", "freeport", "southern copper",
     "aluminium", "aluminum", "alcoa", "bauxite",
 ]
 
@@ -2199,7 +2245,7 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
         kr = poly_flow.get("key_resistance"); ks = poly_flow.get("key_support")
         if kr and ks:
             parts.append(f"Key S/R from swings: support {ks} | resistance {kr}")
-        for ev_key in ("delta_flip", "exhaustion", "absorption", "imbalance", "bar_streak"):
+        for ev_key in ("block_trade", "delta_flip", "exhaustion", "absorption", "imbalance", "bar_streak"):
             ev = poly_flow.get(ev_key, "")
             if ev:
                 parts.append(f"{ev_key.replace('_',' ').title()}: {ev}")
@@ -2898,6 +2944,7 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
 
         # ── Events ───────────────────────────────────────────────────────────
         events = [
+            poly_flow.get("block_trade"),
             poly_flow.get("delta_flip"),
             poly_flow.get("exhaustion"),
             poly_flow.get("absorption"),
@@ -3060,9 +3107,11 @@ def maybe_send_weekly_summary(state: dict):
 # ─────────────────────────────
 # Thresholds: how much an asset must move since the LAST bot run to fire an alert.
 PRICE_ALERT_THRESHOLDS = {
-    "GC=F":  1.0,   # Gold      — alert on 1%+ move
+    "GC=F":  1.0,   # Gold         — alert on 1%+ move
+    "SI=F":  1.5,   # Silver       — more volatile than gold
+    "HG=F":  1.0,   # Copper       — industrial bellwether
     "ALI=F": 1.5,   # Aluminium
-    "CL=F":  1.5,   # Crude Oil — alert on 1.5%+ move
+    "CL=F":  1.5,   # Crude Oil    — alert on 1.5%+ move
     "^GSPC": 1.0,   # S&P 500
     "QQQ":   1.0,   # Nasdaq
 }
@@ -3257,13 +3306,13 @@ def send_morning_recap(state: dict) -> bool:
         feeds_to_use = WEEKEND_FEEDS
         recap_title  = "🌅 *Good morning — Gold & Oil Weekend Recap*"
         scope_label  = "Last 10 hours (gold, oil, global news)"
-        asset_scope  = "gold, crude oil, aluminium futures, S&P 500, and Nasdaq"
+        asset_scope  = "gold, silver, copper, crude oil, aluminium futures, S&P 500, and Nasdaq"
     else:
         news_hours   = 8
         feeds_to_use = ALL_FEEDS
         recap_title  = "🌅 *Good morning — Overnight Recap*"
         scope_label  = "Last 8 hours (all markets)"
-        asset_scope  = "gold, crude oil, aluminium futures, S&P 500, and Nasdaq"
+        asset_scope  = "gold, silver, copper, crude oil, aluminium futures, S&P 500, and Nasdaq"
 
     # ── 2. Read prices from the shared cache populated by main() ─────────────
     # Do NOT call refresh_price_cache() here — main() already called it once
@@ -3320,8 +3369,8 @@ def send_morning_recap(state: dict) -> bool:
     # ── 5. AI brief ──────────────────────────────────────────────────────────
     if is_weekend:
         task_prompt = """Write a sharp weekend brief for a trader watching futures and indices. Cover:
-1. OVERNIGHT SUMMARY: What moved the most in gold, oil, or indices overnight and why (1-2 sentences)
-2. TOP 2 SETUPS: The 2 clearest setups right now (gold or crude oil preferred since they trade on weekends)
+1. OVERNIGHT SUMMARY: What moved the most in gold, silver, copper, or oil overnight and why (1-2 sentences)
+2. TOP 2 SETUPS: The 2 clearest setups right now (gold, silver, copper or crude oil preferred since they trade on weekends)
 3. KEY LEVELS: One key price level for each setup
 4. MAIN RISK: The one macro or geopolitical factor most likely to drive price today"""
     else:
