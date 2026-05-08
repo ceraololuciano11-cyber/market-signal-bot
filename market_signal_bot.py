@@ -123,14 +123,16 @@ CONTEXT_SYMBOLS = {
 CRYPTO_SYMBOLS: set = set()
 FOREX_SYMBOLS:  set = set()
 
-# Polygon.io symbol mapping (yfinance symbol → Polygon ticker)
-# Stocks use their ticker directly; futures use CME continuous contract symbols
+# Polygon/Massive symbol mapping (yfinance symbol → Massive ticker)
+# Confirmed working on Futures Developer + Stocks Basic plans.
+# Gold/Aluminium continuous futures (GC, ALI) are not in the Massive plan —
+# GLD and DBB are highly liquid ETF proxies that give real Polygon order flow data.
 POLYGON_SYMBOLS = {
-    "^GSPC": "SPY",    # S&P 500 — use SPY ETF as proxy on Polygon stocks API
-    "QQQ":   "QQQ",    # Nasdaq 100 ETF — direct match
-    "CL=F":  "CL",     # Crude Oil continuous futures
-    "GC=F":  "GC",     # Gold continuous futures
-    "ALI=F": "ALI",    # Aluminum futures
+    "^GSPC": "SPY",    # S&P 500 → SPDR S&P 500 ETF (direct proxy)
+    "QQQ":   "QQQ",    # Nasdaq 100 ETF (direct)
+    "CL=F":  "CL",     # Crude Oil → NYMEX continuous futures (real futures data)
+    "GC=F":  "GLD",    # Gold → SPDR Gold ETF (tracks gold 1:1; GC futures not in plan)
+    "ALI=F": "DBB",    # Aluminium → Invesco DB Base Metals ETF (33% alu; ALI not in plan)
 }
 
 def friendly(symbol: str) -> str:
@@ -449,9 +451,13 @@ def signal_confidence(data: dict, bias: str):
             score += 1
 
     # ── 2. VWAP position — buy below, sell above ─────────────────────────────
-    vwap_d   = data.get("vwap") or {}
-    vwap_val = vwap_d.get("vwap") if isinstance(vwap_d, dict) else None
-    price    = data.get("price")
+    # Prefer Polygon VWAP (real) over yfinance approximation when available.
+    poly_flow = data.get("polygon_flow") or {}
+    price     = data.get("price")
+    vwap_val  = poly_flow.get("vwap")                       # Polygon real VWAP
+    if vwap_val is None:                                     # fallback: yfinance VWAP
+        vwap_d   = data.get("vwap") or {}
+        vwap_val = vwap_d.get("vwap") if isinstance(vwap_d, dict) else None
     if vwap_val and price:
         total += 1
         if bias == "BUY"  and price < vwap_val:
@@ -460,8 +466,8 @@ def signal_confidence(data: dict, bias: str):
             score += 1
 
     # ── 3. Order flow bias (cumulative delta direction) ───────────────────────
-    # Uses Polygon real data for SPY/QQQ/CL, yfinance approximation otherwise.
-    of_15 = data.get("order_flow") or {}
+    # Prefer Polygon real flow; fall back to yfinance OHLC approximation.
+    of_15 = poly_flow if poly_flow else (data.get("order_flow") or {})
     if of_15:
         total += 1
         if bias == "BUY"  and of_15.get("of_bias") == "bullish":
@@ -1232,12 +1238,13 @@ def _massive_get_aggs(ticker: str, minutes: int = 300) -> list:
     Returns list of bar dicts (v, vw, o, c, h, l, t, n) or [] on failure.
     Each bar: v=volume, vw=VWAP, o=open, c=close, h=high, l=low, t=timestamp_ms, n=trades
 
-    Confirmed working on current plan:
-      CL  (Crude Oil futures)  ✅
-      SPY (S&P 500 ETF)       ✅
-      QQQ (Nasdaq 100 ETF)    ✅
-      GC  (Gold futures)      ❌ — NOT_FOUND on Massive, yfinance fallback used
-      ALI (Aluminium futures) ❌ — NOT_FOUND on Massive, yfinance fallback used
+    Confirmed working tickers on Massive (Futures Developer + Stocks Basic plans):
+      CL  → Crude Oil futures (NYMEX, real futures)       ✅
+      SPY → S&P 500 ETF proxy                             ✅
+      QQQ → Nasdaq 100 ETF                                ✅
+      GLD → SPDR Gold ETF (tracks gold 1:1, highly liquid) ✅  ← GC futures not in plan
+      DBB → Invesco DB Base Metals ETF (33% aluminium)    ✅  ← ALI futures not in plan
+    Also includes DELAYED status (equivalent to real data for our use).
     """
     try:
         from datetime import date, timedelta
@@ -1253,74 +1260,170 @@ def _massive_get_aggs(ticker: str, minutes: int = 300) -> list:
         r = requests.get(url, params=params, timeout=12)
         if r.status_code == 200:
             data = r.json()
-            if data.get("status") == "OK":
-                return data.get("results", [])
+            # Accept both OK and DELAYED — DELAYED just means 15-min lag, data is real
+            if data.get("status") in ("OK", "DELAYED"):
+                results = data.get("results", [])
+                if results:
+                    return results
     except Exception as e:
         print(f"  Massive aggs error ({ticker}): {e}")
     return []
 
 
-def _calc_delta_from_bars(bars: list) -> dict:
+def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
     """
-    Derive order flow metrics from 1-minute OHLCV bars.
+    Comprehensive order flow analysis from Polygon 1-minute OHLCV bars.
 
     Bar classification (close-tick rule):
-      close > open  → buying bar   (+volume)
-      close < open  → selling bar  (-volume)
-      close == open → neutral (split evenly)
+      close > open  → market buy pressure   (+volume)
+      close < open  → market sell pressure  (-volume)
+      close == open → neutral (split 50/50)
 
-    Returns: cum_delta, buy_pct, poc, vwap, vol_spike, delta_flip, of_bias
+    Computed metrics (all from real Polygon data):
+      DELTA      : cum_delta, buy_pct, of_bias, per-bar delta
+      VWAP       : vwap price, price position vs VWAP, % distance
+      VOLUME PROFILE: vpoc (most-traded price), value area high/low (VAH/VAL, 70% vol)
+      EVENTS     : delta_flip, exhaustion, absorption, imbalance
+      STRUCTURE  : bar_streak, market structure (HH/HL or LH/LL), swing S/R levels
+      VOLUME     : vol_spike (last bar vs session average)
     """
     if len(bars) < 10:
         return {}
 
+    # ── Per-bar pass ──────────────────────────────────────────────────────────
     buy_vol = sell_vol = 0.0
-    deltas  = []          # per-bar signed volume
-    price_vol: dict = {}  # vwap → total volume (for POC)
+    deltas: list = []
+    price_vol: dict = {}          # price → cumulative volume (volume profile)
     total_vol_all = 0.0
-    avg_vol = sum(b["v"] for b in bars) / len(bars)
+    vols = [b.get("v") or 0 for b in bars]
+    avg_vol = sum(vols) / len(vols) if vols else 1.0
+
+    bar_data: list = []
 
     for b in bars:
-        v  = b.get("v", 0)
-        o  = b.get("o", 0)
-        c  = b.get("c", 0)
-        vw = round(b.get("vw", c), 2)
+        v  = b.get("v") or 0
+        o  = b.get("o") or 0
+        c  = b.get("c") or 0
+        h  = b.get("h") or c
+        l  = b.get("l") or c
+        vw = b.get("vw") or c
+
         total_vol_all += v
-        price_vol[vw] = price_vol.get(vw, 0) + v
+
+        # Volume profile: bucket by typical price (H+L+C)/3 rounded to 2dp
+        tp = round((h + l + c) / 3, 2)
+        price_vol[tp] = price_vol.get(tp, 0) + v
+
         if c > o:
-            deltas.append(v)
-            buy_vol += v
+            bar_delta = v
+            buy_vol  += v
         elif c < o:
-            deltas.append(-v)
+            bar_delta = -v
             sell_vol += v
         else:
-            deltas.append(0)
+            bar_delta = 0
             buy_vol  += v / 2
             sell_vol += v / 2
+
+        deltas.append(bar_delta)
+        bar_data.append({"v": v, "o": o, "c": c, "h": h, "l": l,
+                         "vw": vw, "delta": bar_delta, "range": h - l})
 
     total_vol = buy_vol + sell_vol
     cum_delta = round(buy_vol - sell_vol)
     buy_pct   = round(buy_vol / total_vol * 100) if total_vol > 0 else 50
-    poc       = max(price_vol, key=price_vol.get) if price_vol else None
+    bias      = "bullish" if cum_delta > 0 else "bearish" if cum_delta < 0 else "neutral"
 
-    # VWAP from last bar (Polygon provides per-bar VWAP)
-    vwap = bars[-1].get("vw") if bars else None
+    # ── VWAP (Polygon provides per-bar VWAP in 'vw' field) ───────────────────
+    last_bar     = bar_data[-1]
+    vwap_val     = last_bar.get("vw")
+    current_px   = last_bar.get("c") or 0
 
-    # Volume spike — last bar vs average
-    last_vol   = bars[-1].get("v", 0) if bars else 0
-    vol_spike  = round(last_vol / avg_vol, 1) if avg_vol > 0 else 1.0
+    price_vs_vwap = "n/a"
+    vwap_dist_pct = 0.0
+    if vwap_val and current_px and vwap_val > 0:
+        vwap_dist_pct = round((current_px - vwap_val) / vwap_val * 100, 2)
+        if vwap_dist_pct > 0.05:
+            price_vs_vwap = f"above (+{vwap_dist_pct}%)"
+        elif vwap_dist_pct < -0.05:
+            price_vs_vwap = f"below ({vwap_dist_pct}%)"
+        else:
+            price_vs_vwap = "at VWAP"
 
-    # Delta flip — did direction change in last 6 bars?
-    flip = ""
+    # ── Volume Profile: VPOC + Value Area (70% of volume) ────────────────────
+    vpoc = max(price_vol, key=price_vol.get) if price_vol else None
+    vah = val = None
+    if price_vol and total_vol_all > 0:
+        target = total_vol_all * 0.70
+        accumulated = 0.0
+        va_prices: list = []
+        for px, vol in sorted(price_vol.items(), key=lambda x: x[1], reverse=True):
+            accumulated += vol
+            va_prices.append(px)
+            if accumulated >= target:
+                break
+        if va_prices:
+            vah = round(max(va_prices), 4)
+            val = round(min(va_prices), 4)
+
+    # ── Delta flip ────────────────────────────────────────────────────────────
+    delta_flip = ""
     if len(deltas) >= 6:
-        recent = sum(deltas[-3:])
-        prior  = sum(deltas[-6:-3])
-        if prior < 0 and recent > 0:
-            flip = "Bullish delta flip — sellers exhausted, buyers stepping in"
-        elif prior > 0 and recent < 0:
-            flip = "Bearish delta flip — buyers exhausted, sellers pressing"
+        recent_d = sum(deltas[-3:])
+        prior_d  = sum(deltas[-6:-3])
+        if prior_d < 0 and recent_d > 0:
+            delta_flip = "Bullish delta flip — sellers exhausted, buyers stepping in"
+        elif prior_d > 0 and recent_d < 0:
+            delta_flip = "Bearish delta flip — buyers exhausted, sellers pressing"
 
-    # Consecutive bar streak (momentum)
+    # ── Exhaustion ────────────────────────────────────────────────────────────
+    # Trend bars losing volume + delta → one side running out of orders
+    exhaustion = ""
+    if len(bar_data) >= 8:
+        first4 = bar_data[-8:-4]
+        last4  = bar_data[-4:]
+        f_vol  = sum(b["v"]     for b in first4)
+        l_vol  = sum(b["v"]     for b in last4)
+        f_dlt  = sum(b["delta"] for b in first4)
+        l_dlt  = sum(b["delta"] for b in last4)
+        if f_vol > 0 and l_vol < f_vol * 0.6:      # volume fading ≥40%
+            if f_dlt > 0 and l_dlt < f_dlt * 0.4:
+                exhaustion = "Buying exhaustion — volume and buy delta both fading"
+            elif f_dlt < 0 and l_dlt > f_dlt * 0.4:
+                exhaustion = "Selling exhaustion — volume and sell delta both fading"
+
+    # ── Absorption ────────────────────────────────────────────────────────────
+    # High volume + tiny price range → opposing side absorbing all orders
+    absorption = ""
+    if len(bar_data) >= 3:
+        last3     = bar_data[-3:]
+        avg_rng3  = sum(b["range"] for b in last3) / 3
+        avg_vol3  = sum(b["v"]     for b in last3) / 3
+        ref_price = last3[-1]["c"] or 1
+        if avg_vol3 > avg_vol * 1.8 and avg_rng3 < ref_price * 0.0015:
+            net3 = sum(b["delta"] for b in last3)
+            if net3 > 0:
+                absorption = "Seller absorption — buyers driving hard but price contained; sellers absorbing supply"
+            else:
+                absorption = "Buyer absorption — sellers pressing but price not dropping; buyers absorbing selling"
+
+    # ── Imbalance ─────────────────────────────────────────────────────────────
+    # Consecutive bars dominated by one side
+    imbalance = ""
+    if len(deltas) >= 10:
+        last10 = deltas[-10:]
+        buys   = sum(1 for d in last10 if d > 0)
+        sells  = sum(1 for d in last10 if d < 0)
+        if buys >= 8:
+            imbalance = f"Strong buy imbalance — {buys}/10 recent bars bullish"
+        elif sells >= 8:
+            imbalance = f"Strong sell imbalance — {sells}/10 recent bars bearish"
+        elif buys >= 7:
+            imbalance = f"Moderate buy imbalance — {buys}/10 recent bars bullish"
+        elif sells >= 7:
+            imbalance = f"Moderate sell imbalance — {sells}/10 recent bars bearish"
+
+    # ── Bar streak ────────────────────────────────────────────────────────────
     streak = 0
     streak_dir = None
     for d in reversed(deltas):
@@ -1335,36 +1438,77 @@ def _calc_delta_from_bars(bars: list) -> dict:
         else:
             break
 
-    streak_str = ""
+    bar_streak = ""
     if streak >= 3 and streak_dir:
-        streak_str = f"{streak} consecutive {'buying' if streak_dir == 'buy' else 'selling'} bars"
+        bar_streak = f"{streak} consecutive {'buying' if streak_dir == 'buy' else 'selling'} bars"
 
-    bias = "bullish" if cum_delta > 0 else "bearish" if cum_delta < 0 else "neutral"
+    # ── Volume spike ──────────────────────────────────────────────────────────
+    last_vol  = bar_data[-1]["v"]
+    vol_spike = round(last_vol / avg_vol, 1) if avg_vol > 0 else 1.0
+
+    # ── Market structure from swing highs/lows (last 30 bars) ────────────────
+    window    = bar_data[-30:] if len(bar_data) >= 30 else bar_data
+    swg_highs: list = []
+    swg_lows:  list = []
+    for i in range(1, len(window) - 1):
+        if window[i]["h"] > window[i-1]["h"] and window[i]["h"] > window[i+1]["h"]:
+            swg_highs.append(round(window[i]["h"], 4))
+        if window[i]["l"] < window[i-1]["l"] and window[i]["l"] < window[i+1]["l"]:
+            swg_lows.append(round(window[i]["l"], 4))
+
+    mkt_structure = "ranging"
+    if len(swg_highs) >= 2 and len(swg_lows) >= 2:
+        if swg_highs[-1] > swg_highs[-2] and swg_lows[-1] > swg_lows[-2]:
+            mkt_structure = "bullish (HH + HL)"
+        elif swg_highs[-1] < swg_highs[-2] and swg_lows[-1] < swg_lows[-2]:
+            mkt_structure = "bearish (LH + LL)"
+
+    key_resistance = round(max(swg_highs[-3:]), 4) if swg_highs else None
+    key_support    = round(min(swg_lows[-3:]),  4) if swg_lows  else None
 
     return {
-        "cum_delta":   cum_delta,
-        "buy_pct":     buy_pct,
-        "poc":         poc,
-        "vwap":        round(vwap, 2) if vwap else None,
-        "vol_spike":   vol_spike,
-        "delta_flip":  flip,
-        "bar_streak":  streak_str,
-        "of_bias":     bias,
-        "data_source": "polygon_real",
+        # Core delta
+        "cum_delta":       cum_delta,
+        "buy_pct":         buy_pct,
+        "of_bias":         bias,
+        # VWAP
+        "vwap":            round(vwap_val, 4) if vwap_val else None,
+        "price_vs_vwap":   price_vs_vwap,
+        "vwap_dist_pct":   vwap_dist_pct,
+        # Volume profile
+        "vpoc":            vpoc,
+        "vah":             vah,
+        "val":             val,
+        # Events
+        "delta_flip":      delta_flip,
+        "exhaustion":      exhaustion,
+        "absorption":      absorption,
+        "imbalance":       imbalance,
+        "bar_streak":      bar_streak,
+        "vol_spike":       vol_spike,
+        # Structure
+        "mkt_structure":   mkt_structure,
+        "key_resistance":  key_resistance,
+        "key_support":     key_support,
+        # Meta
+        "data_source":     "polygon_real",
+        "bar_count":       len(bars),
+        "proxy_note":      proxy_note,
     }
 
 
 def fetch_polygon_order_flow(symbol: str) -> dict:
     """
-    Fetch real order flow from api.massive.com using 1-minute aggregate bars.
+    Fetch comprehensive real order flow from api.massive.com (1-min bars).
 
-    Confirmed working on Futures Developer plan:
-      ^GSPC → SPY  1-min bars ✅  (Stocks Basic free plan via Massive)
-      QQQ   → QQQ  1-min bars ✅
-      CL=F  → CL   1-min bars ✅  (Futures Developer plan — real crude oil data)
-      GC=F  → GC   NOT_FOUND  ❌  → returns {} → yfinance approximation
-      ALI=F → ALI  NOT_FOUND  ❌  → returns {} → yfinance approximation
-
+    Ticker mapping (all confirmed working on current Massive plan):
+      ^GSPC → SPY  ✅  S&P 500 ETF (direct proxy)
+      QQQ   → QQQ  ✅  Nasdaq 100 ETF (direct)
+      CL=F  → CL   ✅  Crude Oil futures — real NYMEX continuous contract
+      GC=F  → GLD  ✅  Gold: SPDR Gold ETF (tracks gold price 1:1, highly liquid)
+                        GC continuous futures not in plan; GLD is the best proxy
+      ALI=F → DBB  ✅  Aluminium: Invesco DB Base Metals ETF (33% aluminium,
+                        33% copper, 33% zinc) — ALI futures not in plan
     Falls back gracefully to {} on any failure.
     """
     if not POLYGON_KEY:
@@ -1373,15 +1517,19 @@ def fetch_polygon_order_flow(symbol: str) -> dict:
     if not poly_sym:
         return {}
 
-    # Only confirmed-working tickers — GC and ALI not available on this plan
-    if symbol not in ("^GSPC", "QQQ", "CL=F"):
-        return {}
+    proxy_notes = {
+        "GC=F":  "via GLD (SPDR Gold ETF — tracks gold 1:1)",
+        "ALI=F": "via DBB (Base Metals ETF — 33% aluminium)",
+    }
+    proxy_note = proxy_notes.get(symbol, "")
 
     try:
         bars = _massive_get_aggs(poly_sym, minutes=300)
         if not bars:
+            print(f"  Massive: no bars returned for {poly_sym} ({symbol})")
             return {}
-        return _calc_delta_from_bars(bars)
+        print(f"  Massive: {len(bars)} bars for {poly_sym} ({symbol}){' ' + proxy_note if proxy_note else ''}")
+        return _calc_rich_flow(bars, proxy_note=proxy_note)
     except Exception as e:
         print(f"  Massive order flow error ({symbol}): {e}")
         return {}
@@ -2018,34 +2166,44 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
 
     macro_note = "This is a macro event affecting all instruments." if is_macro(title) else ""
 
-    # ── Polygon real order flow context ──────────────────────────────────────
-    poly_flow = primary_data.get("polygon_flow") or primary_data.get("order_flow") or {}
+    # ── Polygon real order flow context (fed into AI prompt) ─────────────────
+    poly_flow = primary_data.get("polygon_flow") or {}
     polygon_context = ""
     if poly_flow.get("data_source") == "polygon_real":
-        parts = []
+        pn    = poly_flow.get("proxy_note", "")
+        parts = [f"Source: Polygon 1-min bars{' (' + pn + ')' if pn else ''}"]
+
         delta = poly_flow.get("cum_delta")
         if delta is not None:
-            parts.append(f"Cumulative delta (1-min bars): {delta:+,.0f} ({'bullish' if delta > 0 else 'bearish'} flow)")
+            parts.append(f"Cumulative delta: {delta:+,.0f} ({'bullish' if delta > 0 else 'bearish'} net flow)")
         buy_pct = poly_flow.get("buy_pct")
         if buy_pct is not None:
-            parts.append(f"Buy-side pressure: {buy_pct}% ({'buyers dominant' if buy_pct >= 55 else 'sellers dominant' if buy_pct <= 45 else 'balanced'})")
-        poc = poly_flow.get("poc")
-        if poc is not None:
-            parts.append(f"Point of Control (most-traded price): {poc}")
-        vwap = poly_flow.get("vwap")
-        if vwap is not None:
-            parts.append(f"VWAP: {vwap}")
-        vol_spike = poly_flow.get("vol_spike")
-        if vol_spike and vol_spike >= 1.5:
-            parts.append(f"Volume spike: {vol_spike}x average — elevated participation")
-        flip = poly_flow.get("delta_flip")
-        if flip:
-            parts.append(f"Delta flip detected: {flip}")
-        streak = poly_flow.get("bar_streak")
-        if streak:
-            parts.append(f"Bar momentum: {streak}")
-        if parts:
-            polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon 1-min bars) ━━━\n" + "\n".join(parts)
+            lbl = "buyers dominant" if buy_pct >= 55 else "sellers dominant" if buy_pct <= 45 else "balanced"
+            parts.append(f"Buy pressure: {buy_pct}% ({lbl})")
+        vwap_v = poly_flow.get("vwap")
+        pvwap  = poly_flow.get("price_vs_vwap", "")
+        if vwap_v is not None:
+            parts.append(f"VWAP: {vwap_v} — price is {pvwap}")
+        vpoc = poly_flow.get("vpoc")
+        if vpoc is not None:
+            parts.append(f"VPOC (most-traded price): {vpoc}")
+        vah = poly_flow.get("vah"); val = poly_flow.get("val")
+        if vah and val:
+            parts.append(f"Value Area: {val} – {vah} (70% of session volume)")
+        vs = poly_flow.get("vol_spike")
+        if vs and vs >= 1.5:
+            parts.append(f"Volume spike: {vs}× average — elevated participation")
+        mkt = poly_flow.get("mkt_structure", "")
+        if mkt:
+            parts.append(f"Market structure: {mkt}")
+        kr = poly_flow.get("key_resistance"); ks = poly_flow.get("key_support")
+        if kr and ks:
+            parts.append(f"Key S/R from swings: support {ks} | resistance {kr}")
+        for ev_key in ("delta_flip", "exhaustion", "absorption", "imbalance", "bar_streak"):
+            ev = poly_flow.get(ev_key, "")
+            if ev:
+                parts.append(f"{ev_key.replace('_',' ').title()}: {ev}")
+        polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon) ━━━\n" + "\n".join(parts)
 
     prim_name = friendly(primary_symbol) if primary_symbol else "the most affected asset"
     prim_price = primary_data.get("price", "n/a")
@@ -2687,33 +2845,69 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
 
     # Polygon real order flow section (only when real data available — SPY/QQQ)
     poly_section = ""
-    poly_flow = primary_data.get("polygon_flow") or primary_data.get("order_flow") or {}
+    poly_flow = primary_data.get("polygon_flow") or {}
     if poly_flow.get("data_source") == "polygon_real":
-        poly_lines = ["📡 *Real Order Flow (Polygon 1-min bars):*"]
+        pn = poly_flow.get("proxy_note", "")
+        header = f"📡 *Real Order Flow (Polygon){' — ' + pn if pn else ''}:*"
+        poly_lines = [header]
+
+        # ── Delta & pressure ─────────────────────────────────────────────────
         delta = poly_flow.get("cum_delta")
         if delta is not None:
-            d_sign = "+" if delta >= 0 else ""
+            d_sign     = "+" if delta >= 0 else ""
             bias_emoji = "🟢" if delta > 0 else "🔴" if delta < 0 else "⚪"
-            poly_lines.append(f"  {bias_emoji} Cum Delta: {d_sign}{delta:,.0f}")
+            poly_lines.append(f"  {bias_emoji} Cum Delta:  {d_sign}{delta:,.0f}")
         buy_pct = poly_flow.get("buy_pct")
         if buy_pct is not None:
             bar = "█" * (buy_pct // 10) + "░" * (10 - buy_pct // 10)
-            poly_lines.append(f"  Flow: {buy_pct}% buy  |{bar}|")
-        vwap = poly_flow.get("vwap")
-        if vwap is not None:
-            poly_lines.append(f"  VWAP: {vwap}")
-        poc = poly_flow.get("poc")
-        if poc is not None:
-            poly_lines.append(f"  POC:  {poc} (most traded price)")
+            lbl = "buyers dominant" if buy_pct >= 55 else "sellers dominant" if buy_pct <= 45 else "balanced"
+            poly_lines.append(f"  Pressure:   {buy_pct}% buy |{bar}| {lbl}")
+
+        # ── VWAP ─────────────────────────────────────────────────────────────
+        vwap_v = poly_flow.get("vwap")
+        pvwap  = poly_flow.get("price_vs_vwap", "")
+        if vwap_v is not None:
+            poly_lines.append(f"  VWAP:       {vwap_v} → price {pvwap}")
+
+        # ── Volume Profile ────────────────────────────────────────────────────
+        vpoc = poly_flow.get("vpoc")
+        vah  = poly_flow.get("vah")
+        val  = poly_flow.get("val")
+        if vpoc is not None:
+            poly_lines.append(f"  VPOC:       {vpoc}  ← most traded price")
+        if vah is not None and val is not None:
+            poly_lines.append(f"  Value Area: {val} – {vah}  (70% of vol)")
+
+        # ── Volume spike ─────────────────────────────────────────────────────
         vol_spike = poly_flow.get("vol_spike")
         if vol_spike and vol_spike >= 1.5:
-            poly_lines.append(f"  Vol:  {vol_spike}x average ⚡ spike")
-        flip = poly_flow.get("delta_flip")
-        if flip:
-            poly_lines.append(f"  ⚡ {flip}")
-        streak = poly_flow.get("bar_streak")
-        if streak:
-            poly_lines.append(f"  📊 {streak}")
+            poly_lines.append(f"  Vol Spike:  {vol_spike}× average ⚡")
+
+        # ── Structure ────────────────────────────────────────────────────────
+        mkt = poly_flow.get("mkt_structure", "")
+        if mkt:
+            poly_lines.append(f"  Structure:  {mkt}")
+        kr = poly_flow.get("key_resistance")
+        ks = poly_flow.get("key_support")
+        if kr is not None and ks is not None:
+            poly_lines.append(f"  S/R:        support {ks} | resist {kr}")
+        elif kr is not None:
+            poly_lines.append(f"  Resistance: {kr}")
+        elif ks is not None:
+            poly_lines.append(f"  Support:    {ks}")
+
+        # ── Events ───────────────────────────────────────────────────────────
+        events = [
+            poly_flow.get("delta_flip"),
+            poly_flow.get("exhaustion"),
+            poly_flow.get("absorption"),
+            poly_flow.get("imbalance"),
+            poly_flow.get("bar_streak"),
+        ]
+        for ev in events:
+            if ev:
+                poly_lines.append(f"  ⚡ {ev}")
+
         poly_section = "\n".join(poly_lines) + "\n\n"
 
     # Multi-source
