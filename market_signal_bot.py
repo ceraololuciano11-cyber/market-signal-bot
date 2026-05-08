@@ -419,30 +419,39 @@ def volume_label(ratio) -> str:
 def signal_confidence(data: dict, bias: str):
     """Returns (score, total) where score = indicators agreeing with bias.
 
-    7 focused checks — each one earns its place:
+    15 checks across three layers — each one earns its place:
 
-      1. Multi-TF trend alignment  — 1 vote if majority (3+/4) of timeframes agree
-      2. VWAP position             — buying below / selling above VWAP
-      3. Order flow bias           — cumulative delta direction (Polygon real when available)
-      4. Buy%                      — Polygon buy-side pressure
-      5. Volume confirmation       — last bar >= 1.5× average (conviction behind the move)
-      6. RSI extremes only         — <35 oversold (BUY), >65 overbought (SELL)
-      7. Delta flip                — momentum reversal confirming the bias direction
+    LAYER A — Technical / macro (yfinance + context)
+      1. Multi-TF trend alignment  — 3+/4 timeframes agree
+      2. RSI extremes only         — ≤35 oversold (BUY), ≥65 overbought (SELL)
+      3. Volume confirmation       — last bar ≥ 1.5× average
 
-    Removed (were inflating/diluting score without adding information):
-      × MACD — derived from the same EMAs as trend #1, double-counted
-      × RSI divergence — rough OHLC approximation, fires rarely, unreliable
-      × VIX contrarian — fires only at extreme readings, adds noise to total
-      × 4h order flow as separate vote — 4h OHLC approximation too coarse
-      × L2 imbalance — never populated on current Polygon plan (dead field)
+    LAYER B — Core Polygon order flow
+      4. Cumulative delta bias     — net buy/sell pressure direction
+      5. Buy%                      — Polygon buy-side pressure ≥60% / ≤40%
+      6. VWAP position             — price above/below session-anchored VWAP
+      7. VPOC position             — price above/below most-traded price level
+      8. Delta flip                — momentum reversal confirming direction
+
+    LAYER C — Institutional order flow events (Polygon)
+      9.  Market structure         — HH+HL bullish / LH+LL bearish
+      10. Imbalance                — 7+/10 or 8+/10 bars one-sided
+      11. Opening range breakout   — price broke above/below 15-min OR
+      12. Block trade direction    — institutional prints align with bias
+      13. Bar streak               — 3+ consecutive bars in bias direction
+      14. Exhaustion (opposing)    — OPPOSING side exhausted → fuel for bias
+      15. Absorption               — DEFENDING side absorbing → holding level
     """
     if bias not in ("BUY", "SELL"):
         return 0, 0
 
     score, total = 0, 0
+    poly_flow = data.get("polygon_flow") or {}
+    price     = data.get("price")
 
-    # ── 1. Multi-timeframe trend alignment (counts as ONE vote) ──────────────
-    # Requires 3 or more of the 4 timeframes to agree with bias.
+    # ── LAYER A: Technical / macro ────────────────────────────────────────────
+
+    # 1. Multi-timeframe trend alignment (counts as ONE vote)
     trends = [
         data.get("trend", ""),
         data.get("hourly_trend", ""),
@@ -451,72 +460,119 @@ def signal_confidence(data: dict, bias: str):
     ]
     up_count   = sum(1 for t in trends if t and "Uptrend"   in t)
     down_count = sum(1 for t in trends if t and "Downtrend" in t)
-    counted    = up_count + down_count
-    if counted >= 2:          # only vote when we have at least 2 TF readings
+    if (up_count + down_count) >= 2:
         total += 1
-        if bias == "BUY"  and up_count   >= 3:
-            score += 1
-        elif bias == "SELL" and down_count >= 3:
-            score += 1
+        if bias == "BUY"  and up_count   >= 3: score += 1
+        elif bias == "SELL" and down_count >= 3: score += 1
 
-    # ── 2. VWAP position — buy below, sell above ─────────────────────────────
-    # Prefer Polygon VWAP (real) over yfinance approximation when available.
-    poly_flow = data.get("polygon_flow") or {}
-    price     = data.get("price")
-    vwap_val  = poly_flow.get("vwap")                       # Polygon real VWAP
-    if vwap_val is None:                                     # fallback: yfinance VWAP
+    # 2. RSI at genuine extremes only
+    rsi = data.get("rsi")
+    if rsi is not None:
+        total += 1
+        if bias == "BUY"  and rsi <= 35: score += 1
+        elif bias == "SELL" and rsi >= 65: score += 1
+
+    # 3. Volume confirmation
+    vol = data.get("vol_ratio")
+    if vol is not None:
+        total += 1
+        if vol >= 1.5: score += 1
+
+    # ── LAYER B: Core Polygon order flow ─────────────────────────────────────
+
+    # 4. Cumulative delta direction
+    of_src = poly_flow if poly_flow else (data.get("order_flow") or {})
+    if of_src:
+        total += 1
+        if bias == "BUY"  and of_src.get("of_bias") == "bullish": score += 1
+        elif bias == "SELL" and of_src.get("of_bias") == "bearish": score += 1
+
+    # 5. Buy% pressure
+    buy_pct = of_src.get("buy_pct")
+    if buy_pct is not None:
+        total += 1
+        if bias == "BUY"  and buy_pct >= 60: score += 1
+        elif bias == "SELL" and buy_pct <= 40: score += 1
+
+    # 6. VWAP position — prefer Polygon real VWAP, fall back to yfinance
+    vwap_val = poly_flow.get("vwap")
+    if vwap_val is None:
         vwap_d   = data.get("vwap") or {}
         vwap_val = vwap_d.get("vwap") if isinstance(vwap_d, dict) else None
     if vwap_val and price:
         total += 1
-        if bias == "BUY"  and price < vwap_val:
-            score += 1
-        elif bias == "SELL" and price > vwap_val:
-            score += 1
+        if bias == "BUY"  and price < vwap_val: score += 1
+        elif bias == "SELL" and price > vwap_val: score += 1
 
-    # ── 3. Order flow bias (cumulative delta direction) ───────────────────────
-    # Prefer Polygon real flow; fall back to yfinance OHLC approximation.
-    of_15 = poly_flow if poly_flow else (data.get("order_flow") or {})
-    if of_15:
+    # 7. VPOC position — price above VPOC = buyers in control, below = sellers
+    vpoc = poly_flow.get("vpoc")
+    if vpoc and price:
         total += 1
-        if bias == "BUY"  and of_15.get("of_bias") == "bullish":
-            score += 1
-        elif bias == "SELL" and of_15.get("of_bias") == "bearish":
-            score += 1
+        if bias == "BUY"  and price > vpoc: score += 1
+        elif bias == "SELL" and price < vpoc: score += 1
 
-    # ── 4. Buy% — Polygon buy-side pressure ──────────────────────────────────
-    buy_pct = of_15.get("buy_pct")
-    if buy_pct is not None:
-        total += 1
-        if bias == "BUY"  and buy_pct >= 60:
-            score += 1
-        elif bias == "SELL" and buy_pct <= 40:
-            score += 1
-
-    # ── 5. Volume confirmation — elevated volume = real conviction ────────────
-    vol = data.get("vol_ratio")
-    if vol is not None:
-        total += 1
-        if vol >= 1.5:
-            score += 1
-
-    # ── 6. RSI at genuine extremes only (not a free pass) ────────────────────
-    rsi = data.get("rsi")
-    if rsi is not None:
-        total += 1
-        if bias == "BUY"  and rsi <= 35:   # truly oversold
-            score += 1
-        elif bias == "SELL" and rsi >= 65:  # truly overbought
-            score += 1
-
-    # ── 7. Delta flip — momentum reversal confirming direction ───────────────
-    flip = of_15.get("delta_flip", "")
+    # 8. Delta flip — momentum reversal confirming direction
+    flip = of_src.get("delta_flip", "")
     if flip:
         total += 1
-        if bias == "BUY"  and "bullish" in flip.lower():
-            score += 1
-        elif bias == "SELL" and "bearish" in flip.lower():
-            score += 1
+        if bias == "BUY"  and "bullish" in flip.lower(): score += 1
+        elif bias == "SELL" and "bearish" in flip.lower(): score += 1
+
+    # ── LAYER C: Institutional order flow events ──────────────────────────────
+
+    # 9. Market structure alignment
+    mkt = poly_flow.get("mkt_structure", "")
+    if mkt and mkt != "ranging":
+        total += 1
+        if bias == "BUY"  and "bullish" in mkt: score += 1
+        elif bias == "SELL" and "bearish" in mkt: score += 1
+
+    # 10. Imbalance — directional dominance
+    imbalance = poly_flow.get("imbalance", "")
+    if imbalance:
+        total += 1
+        if bias == "BUY"  and "buy" in imbalance.lower(): score += 1
+        elif bias == "SELL" and "sell" in imbalance.lower(): score += 1
+
+    # 11. Opening range breakout
+    or_st = poly_flow.get("or_status", "")
+    if or_st and "inside" not in or_st:
+        total += 1
+        if bias == "BUY"  and "bullish breakout" in or_st: score += 1
+        elif bias == "SELL" and "bearish breakout" in or_st: score += 1
+
+    # 12. Block trade direction — institutional print aligns with bias
+    block = poly_flow.get("block_trade", "")
+    if block:
+        total += 1
+        if bias == "BUY"  and "buy" in block.lower(): score += 1
+        elif bias == "SELL" and "sell" in block.lower(): score += 1
+
+    # 13. Bar streak — consecutive bars in bias direction
+    streak = poly_flow.get("bar_streak", "")
+    if streak:
+        total += 1
+        if bias == "BUY"  and "buying" in streak: score += 1
+        elif bias == "SELL" and "selling" in streak: score += 1
+
+    # 14. Exhaustion — of the OPPOSING side = fuel still available for bias
+    #     "Selling exhaustion" + BUY  = sellers running out → good for buyers
+    #     "Buying exhaustion"  + SELL = buyers running out → good for sellers
+    #     Exhaustion of the SAME side as bias = warning → adds to total, no score
+    exhaustion = poly_flow.get("exhaustion", "")
+    if exhaustion:
+        total += 1
+        if bias == "BUY"  and "selling" in exhaustion.lower(): score += 1
+        elif bias == "SELL" and "buying"  in exhaustion.lower(): score += 1
+
+    # 15. Absorption — of the defending side = confirms level is holding
+    #     "Buyer absorption"  = buyers absorbing sellers → floor holding → BUY
+    #     "Seller absorption" = sellers absorbing buyers → ceiling holding → SELL
+    absorption = poly_flow.get("absorption", "")
+    if absorption:
+        total += 1
+        if bias == "BUY"  and "buyer absorption"  in absorption.lower(): score += 1
+        elif bias == "SELL" and "seller absorption" in absorption.lower(): score += 1
 
     return score, total
 
@@ -2289,13 +2345,13 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
             ev = poly_flow.get(ev_key, "")
             if ev:
                 parts.append(f"{ev_key.replace('_',' ').title()}: {ev}")
-        polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon) ━━━\n" + "\n".join(parts)
+        polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon — live exchange data) ━━━\n" + "\n".join(parts)
 
     prim_name = friendly(primary_symbol) if primary_symbol else "the most affected asset"
     prim_price = primary_data.get("price", "n/a")
     prim_move  = f"{primary_data['move']:+.2f}%" if primary_data.get("move") is not None else "n/a"
 
-    prompt = f"""You are a senior institutional trading analyst with deep expertise in macro, technical analysis, and risk management.
+    prompt = f"""You are a senior institutional trading analyst with deep expertise in macro, technical analysis, order flow, and risk management.
 
 ━━━ HEADLINE ━━━
 {title}
@@ -2310,29 +2366,45 @@ Signal type: {signal_type} | Market reaction so far: {reaction}
 Market fear: {fear_str}
 Dollar Index: {dxy_str}
 High-impact events today: {cal_str}
-{macro_note}{polygon_context}
+{macro_note}
+{polygon_context}
 
 ━━━ OTHER INSTRUMENTS (context) ━━━
 {other_str}
 
 ━━━ YOUR TASK ━━━
-Analyze this headline for {prim_name}. Synthesize ALL data above into one unified view:
-1. What does this news fundamentally mean for this asset?
-2. Do the technicals CONFIRM or CONTRADICT? Check: RSI, MACD, trend (all timeframes), divergence, market structure (BOS/CHoCH), order flow delta, liquidity sweeps, VWAP position, candle patterns, premium/discount zone.
-3. Does ORDER FLOW agree with the directional bias? A delta flip or strong cumulative delta in the same direction as the trade is high-conviction confirmation. Disagreement = lower conviction.
-4. Is price at a favourable location (discount for BUY, premium for SELL)? Are there nearby S/R or order blocks that invalidate the setup?
-5. What is the single biggest risk to this trade?
+Analyze this headline for {prim_name}. Synthesize ALL data above — especially the real Polygon order flow — into one unified view:
+
+1. FUNDAMENTAL: What does this news mean for this asset? Is the move justified or overreacted?
+2. TECHNICAL: Do RSI, trend (all timeframes), VWAP, market structure CONFIRM or CONTRADICT the bias?
+3. ORDER FLOW (most important): Does the real Polygon data agree with the direction?
+   - Cumulative delta, buy%, imbalance, bar streak = directional conviction
+   - Delta flip = momentum turning point (high-conviction entry signal)
+   - Absorption = a level is being defended (can be FOR or AGAINST the trade)
+   - Exhaustion = one side running out of fuel (context-dependent)
+   - Block trades = institutional footprint (smart money direction)
+   - Opening range breakout = structural confirmation for equities
+   Conflicting order flow MUST lower IMPACT. Aligned order flow MUST raise IMPACT.
+4. LOCATION: Is price at a favourable entry (discount for BUY, premium for SELL)? VPOC, VAH/VAL, S/R levels?
+5. RISK: The single biggest reason this trade fails.
+
+IMPACT RATING GUIDE (be strict):
+  1-3 = minor news, order flow neutral or contradicting, technicals mixed
+  4-5 = moderate news, partial alignment
+  6-7 = strong news catalyst + order flow and technicals confirming
+  8-9 = major catalyst + full alignment (delta, imbalance, structure, VWAP all agree)
+  10  = rare — systemic event + every indicator aligned
 
 RULES:
-- Always use full plain-English names. NEVER use tickers (QQQ, SPX, GC, CL, BTC, ETH, DXY, NQ etc.)
+- Always use full plain-English names. NEVER use tickers (QQQ, SPX, GC, CL, DXY, NQ etc.)
 - ENTRY, STOP, TARGET are for {prim_name} ONLY — numbers only, no words
-- REASON must cover: (1) news catalyst, (2) multi-timeframe technical + order flow read, (3) exact trade logic with key level
+- REASON must cover: (1) news catalyst, (2) order flow read (reference specific metrics), (3) exact trade logic with key level
 
 Return EXACTLY this format, no extra text:
 BIAS: BUY / SELL / NEUTRAL
-IMPACT: [1-10 — how market-moving is this news]
+IMPACT: [1-10]
 AFFECTS: [full plain-English names of affected instruments]
-REASON: [3 sentences max: catalyst + technicals/order flow read + trade logic]
+REASON: [3 sentences max: catalyst + order flow + trade logic]
 ENTRY: [price or range for {prim_name} only — numbers only]
 STOP: [stop loss — single number]
 TARGET: [profit target — single number or range]
