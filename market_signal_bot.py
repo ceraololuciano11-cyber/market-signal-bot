@@ -1314,7 +1314,7 @@ def _massive_get_aggs(ticker: str, minutes: int = 300) -> list:
     Also includes DELAYED status (equivalent to real data for our use).
     """
     try:
-        from datetime import date, timedelta
+        from datetime import date
         today     = date.today().isoformat()
         from_date = (date.today() - timedelta(days=3)).isoformat()  # covers weekends
         url = f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/minute/{from_date}/{today}"
@@ -1535,7 +1535,9 @@ def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
             bn = b.get("n") or 0
             if bn > 0 and bv > 0:
                 bar_avg_size = bv / bn
-                if bar_avg_size >= avg_size * 5 and bv >= avg_vol * 1.5:
+                # Block trade: high volume + very few individual transactions
+                # avg_size * 5 = abnormally large trade size; bn < avg_n * 0.5 = unusually few trades
+                if bar_avg_size >= avg_size * 5 and bv >= avg_vol * 1.5 and bn < avg_n * 0.5:
                     direction = "buy" if (b.get("c", 0) >= b.get("o", 0)) else "sell"
                     block_trades.append(direction)
     block_trade_signal = ""
@@ -2984,6 +2986,7 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         streak_section += "\n"
 
     # VIX — market fear gauge
+    vix_data   = _price_cache.get("^VIX")
     fg_section = ""
     if vix_data:
         vix_price = vix_data.get("price")
@@ -3248,7 +3251,6 @@ def maybe_send_breakout_alerts(state: dict):
     """
     last_breakouts = state.get("__last_breakouts__", {})
     alerts         = []
-    weekend        = is_weekend()
     now            = now_utc().isoformat()
     cooldown_min   = 60  # don't re-fire the same break within 60 min
 
@@ -3365,7 +3367,6 @@ def maybe_send_price_alerts(state: dict):
     """Fire a Telegram alert if any asset moved significantly since the last run."""
     last_prices = state.get("__last_prices__", {})
     alerts      = []
-    weekend     = is_weekend()
 
     for sym, data in _price_cache.items():
         if sym not in ASSET_MAP:
@@ -3420,10 +3421,10 @@ def send_morning_recap(state: dict) -> bool:
     print("  Generating morning recap...")
     zh         = zurich_now()
     weekday    = zh.weekday()   # 0=Mon … 6=Sun
-    is_weekend = weekday >= 5   # Sat=5, Sun=6
+    is_weekend_day = weekday >= 5   # Sat=5, Sun=6
 
     # ── 1. Decide scope ──────────────────────────────────────────────────────
-    if is_weekend:
+    if is_weekend_day:
         news_hours   = 10
         feeds_to_use = WEEKEND_FEEDS
         recap_title  = "🌅 *Good morning — Gold & Oil Weekend Recap*"
@@ -3459,7 +3460,8 @@ def send_morning_recap(state: dict) -> bool:
     headlines = []
     for url, _stype in feeds_to_use:
         try:
-            feed = feedparser.parse(url)
+            raw  = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            feed = feedparser.parse(raw.content)
             for entry in feed.entries[:8]:
                 title = entry.get("title", "").strip()
                 if not title or not is_important(title):
@@ -3476,8 +3478,8 @@ def send_morning_recap(state: dict) -> bool:
                     headlines.append(title)
                 if len(headlines) >= 20:
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  Recap feed error ({url[:55]}): {e}")
         if len(headlines) >= 20:
             break
 
@@ -3489,7 +3491,7 @@ def send_morning_recap(state: dict) -> bool:
     fear_str = f"VIX: {vix['price']} ({vix_label(vix['price'])})" if vix and vix.get("price") else "n/a"
 
     # ── 5. AI brief ──────────────────────────────────────────────────────────
-    if is_weekend:
+    if is_weekend_day:
         task_prompt = """Write a sharp weekend brief for a trader watching futures and indices. Cover:
 1. OVERNIGHT SUMMARY: What moved the most in gold, silver, copper, or oil overnight and why (1-2 sentences)
 2. TOP 2 SETUPS: The 2 clearest setups right now (gold, silver, copper or crude oil preferred since they trade on weekends)
@@ -3537,7 +3539,7 @@ Rules:
 
     # ── 6. Format & send ─────────────────────────────────────────────────────
     cal_line = ""
-    if not is_weekend:
+    if not is_weekend_day:
         try:
             events = fetch_calendar()
             if events:
@@ -3635,7 +3637,8 @@ def main():
 
     for url, signal_type in active_feeds:
         try:
-            feed = feedparser.parse(url)
+            raw  = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            feed = feedparser.parse(raw.content)
             for entry in feed.entries[:5]:
                 title = entry.get("title", "").strip()
                 if not title:
