@@ -406,114 +406,101 @@ def volume_label(ratio) -> str:
 # RSI, MACD, 15m trend, 1h trend, daily trend, volume, RSI divergence).
 # ─────────────────────────────
 def signal_confidence(data: dict, bias: str):
-    """Returns (score, total) where score = indicators agreeing with bias."""
+    """Returns (score, total) where score = indicators agreeing with bias.
+
+    7 focused checks — each one earns its place:
+
+      1. Multi-TF trend alignment  — 1 vote if majority (3+/4) of timeframes agree
+      2. VWAP position             — buying below / selling above VWAP
+      3. Order flow bias           — cumulative delta direction (Polygon real when available)
+      4. Buy%                      — Polygon buy-side pressure
+      5. Volume confirmation       — last bar >= 1.5× average (conviction behind the move)
+      6. RSI extremes only         — <35 oversold (BUY), >65 overbought (SELL)
+      7. Delta flip                — momentum reversal confirming the bias direction
+
+    Removed (were inflating/diluting score without adding information):
+      × MACD — derived from the same EMAs as trend #1, double-counted
+      × RSI divergence — rough OHLC approximation, fires rarely, unreliable
+      × VIX contrarian — fires only at extreme readings, adds noise to total
+      × 4h order flow as separate vote — 4h OHLC approximation too coarse
+      × L2 imbalance — never populated on current Polygon plan (dead field)
+    """
+    if bias not in ("BUY", "SELL"):
+        return 0, 0
+
     score, total = 0, 0
 
-    rsi = data.get("rsi")
-    if rsi is not None:
+    # ── 1. Multi-timeframe trend alignment (counts as ONE vote) ──────────────
+    # Requires 3 or more of the 4 timeframes to agree with bias.
+    trends = [
+        data.get("trend", ""),
+        data.get("hourly_trend", ""),
+        data.get("4h_trend", ""),
+        data.get("daily_trend", ""),
+    ]
+    up_count   = sum(1 for t in trends if t and "Uptrend"   in t)
+    down_count = sum(1 for t in trends if t and "Downtrend" in t)
+    counted    = up_count + down_count
+    if counted >= 2:          # only vote when we have at least 2 TF readings
         total += 1
-        if bias == "BUY" and rsi < 65:
+        if bias == "BUY"  and up_count   >= 3:
             score += 1
-        elif bias == "SELL" and rsi > 35:
+        elif bias == "SELL" and down_count >= 3:
             score += 1
 
-    macd_val = data.get("macd")
-    macd_sig = data.get("macd_signal")
-    if macd_val is not None and macd_sig is not None:
+    # ── 2. VWAP position — buy below, sell above ─────────────────────────────
+    vwap_d   = data.get("vwap") or {}
+    vwap_val = vwap_d.get("vwap") if isinstance(vwap_d, dict) else None
+    price    = data.get("price")
+    if vwap_val and price:
         total += 1
-        if bias == "BUY" and macd_val > macd_sig:
+        if bias == "BUY"  and price < vwap_val:
             score += 1
-        elif bias == "SELL" and macd_val < macd_sig:
+        elif bias == "SELL" and price > vwap_val:
             score += 1
 
-    trend = data.get("trend", "")
-    if trend and trend != "n/a":
+    # ── 3. Order flow bias (cumulative delta direction) ───────────────────────
+    # Uses Polygon real data for SPY/QQQ/CL, yfinance approximation otherwise.
+    of_15 = data.get("order_flow") or {}
+    if of_15:
         total += 1
-        if bias == "BUY" and "Uptrend" in trend:
+        if bias == "BUY"  and of_15.get("of_bias") == "bullish":
             score += 1
-        elif bias == "SELL" and "Downtrend" in trend:
+        elif bias == "SELL" and of_15.get("of_bias") == "bearish":
             score += 1
 
-    # 1h trend — multi-timeframe confirmation
-    hourly = data.get("hourly_trend", "")
-    if hourly and hourly != "n/a":
+    # ── 4. Buy% — Polygon buy-side pressure ──────────────────────────────────
+    buy_pct = of_15.get("buy_pct")
+    if buy_pct is not None:
         total += 1
-        if bias == "BUY" and "Uptrend" in hourly:
+        if bias == "BUY"  and buy_pct >= 60:
             score += 1
-        elif bias == "SELL" and "Downtrend" in hourly:
+        elif bias == "SELL" and buy_pct <= 40:
             score += 1
 
-    fourh = data.get("4h_trend", "")
-    if fourh and fourh != "n/a" and bias in ("BUY", "SELL"):
-        total += 1
-        if bias == "BUY" and "Uptrend" in fourh:
-            score += 1
-        elif bias == "SELL" and "Downtrend" in fourh:
-            score += 1
-
-    daily = data.get("daily_trend", "")
-    if daily and daily != "n/a" and bias in ("BUY", "SELL"):
-        total += 1
-        if bias == "BUY" and "Uptrend" in daily:
-            score += 1
-        elif bias == "SELL" and "Downtrend" in daily:
-            score += 1
-
+    # ── 5. Volume confirmation — elevated volume = real conviction ────────────
     vol = data.get("vol_ratio")
-    if vol is not None and bias in ("BUY", "SELL"):
+    if vol is not None:
         total += 1
         if vol >= 1.5:
             score += 1
 
-    # RSI divergence — bullish divergence supports BUY, bearish supports SELL.
-    # Only count when present (don't penalise signals that have no divergence).
-    divergence = data.get("divergence", "")
-    if divergence:
+    # ── 6. RSI at genuine extremes only (not a free pass) ────────────────────
+    rsi = data.get("rsi")
+    if rsi is not None:
         total += 1
-        if bias == "BUY" and divergence == "bullish":
+        if bias == "BUY"  and rsi <= 35:   # truly oversold
             score += 1
-        elif bias == "SELL" and divergence == "bearish":
+        elif bias == "SELL" and rsi >= 65:  # truly overbought
             score += 1
 
-    # VIX sentiment — extreme readings are contrarian signals.
-    vix_price = data.get("vix_price")
-    if vix_price is not None:
+    # ── 7. Delta flip — momentum reversal confirming direction ───────────────
+    flip = of_15.get("delta_flip", "")
+    if flip:
         total += 1
-        # Extreme fear (VIX >= 28) supports BUY — fear marks bottoms
-        # Extreme complacency (VIX <= 14) supports SELL — greed marks tops
-        if bias == "BUY" and vix_price >= 28:
+        if bias == "BUY"  and "bullish" in flip.lower():
             score += 1
-        elif bias == "SELL" and vix_price <= 14:
-            score += 1
-
-    # Order flow delta — does buy/sell pressure confirm the bias?
-    # Counts both 15m (primary) and 4h (macro confirmation) if present.
-    of_15 = data.get("order_flow") or {}
-    of_4h = data.get("4h_order_flow") or {}
-    for of in [of_15, of_4h]:
-        if of and bias in ("BUY", "SELL"):
-            total += 1
-            if bias == "BUY" and of.get("of_bias") == "bullish":
-                score += 1
-            elif bias == "SELL" and of.get("of_bias") == "bearish":
-                score += 1
-
-    # Polygon Level 2 imbalance — read from order_flow dict (where Polygon stores it)
-    l2_imbalance = of_15.get("l2_imbalance", "") or data.get("l2_imbalance", "")
-    if l2_imbalance and bias in ("BUY", "SELL"):
-        total += 1
-        if bias == "BUY" and "bid" in l2_imbalance.lower():
-            score += 1
-        elif bias == "SELL" and "ask" in l2_imbalance.lower():
-            score += 1
-
-    # Polygon buy-side flow — read from order_flow dict (where Polygon stores it)
-    buy_pct = of_15.get("buy_pct") if of_15 else data.get("buy_pct")
-    if buy_pct is not None and bias in ("BUY", "SELL"):
-        total += 1
-        if bias == "BUY" and buy_pct >= 60:
-            score += 1
-        elif bias == "SELL" and buy_pct <= 40:
+        elif bias == "SELL" and "bearish" in flip.lower():
             score += 1
 
     return score, total
@@ -2423,11 +2410,6 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     # AI levels are used only as a last-resort fallback if computation fails
     # (e.g. missing price data on a directional signal).
     primary_data = dict(moves.get(primary_symbol, {}))  # copy so we can annotate safely
-
-    # Inject VIX into primary_data so signal_confidence can use it
-    vix_data = _price_cache.get("^VIX")
-    if vix_data:
-        primary_data["vix_price"] = vix_data.get("price")
 
     computed_levels = compute_trade_levels(bias, primary_data)
     if computed_levels:
