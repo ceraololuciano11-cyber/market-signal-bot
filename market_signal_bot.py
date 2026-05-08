@@ -3747,6 +3747,19 @@ def main():
             # odds favour rejection rather than continuation.
             ai_bias      = sanitize(ai_parsed.get("BIAS", "")).strip().upper()
             primary_data = moves.get(primary_symbol, {})
+
+            # ── Confidence gate — only directional signals with meaningful
+            # indicator alignment get through. Requires ≥35% of available
+            # indicators to agree with the bias direction. When Polygon data
+            # is present this can be up to 15 votes; without it ~5 yfinance
+            # votes. Guards against noise signals where order flow contradicts
+            # the AI direction (e.g. bearish delta on a BUY signal).
+            if ai_bias in ("BUY", "SELL"):
+                conf_score, conf_total = signal_confidence(primary_data, ai_bias)
+                if conf_total >= 5 and (conf_score / conf_total) < 0.35:
+                    print(f"  Low confidence ({conf_score}/{conf_total} = {conf_score/conf_total:.0%}), skipping signal.")
+                    continue
+
             is_trap, trap_reason = is_at_trap_level(ai_bias, primary_data)
             if is_trap:
                 print(f"  {trap_reason}")
