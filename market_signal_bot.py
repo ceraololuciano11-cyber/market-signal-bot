@@ -1345,10 +1345,18 @@ def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
     buy_pct   = round(buy_vol / total_vol * 100) if total_vol > 0 else 50
     bias      = "bullish" if cum_delta > 0 else "bearish" if cum_delta < 0 else "neutral"
 
-    # ── VWAP (Polygon provides per-bar VWAP in 'vw' field) ───────────────────
-    last_bar     = bar_data[-1]
-    vwap_val     = last_bar.get("vw")
-    current_px   = last_bar.get("c") or 0
+    # ── Session-anchored VWAP (∑(typical_price × volume) / ∑volume) ─────────
+    # More accurate than the per-bar 'vw' field because it anchors to bar[0].
+    # Falls back to Polygon's per-bar vw if volume data is missing.
+    last_bar   = bar_data[-1]
+    current_px = last_bar.get("c") or 0
+
+    tpv_sum = sum((b["h"] + b["l"] + b["c"]) / 3 * b["v"] for b in bar_data if b["v"])
+    v_sum   = sum(b["v"] for b in bar_data if b["v"])
+    if v_sum > 0 and tpv_sum > 0:
+        vwap_val = round(tpv_sum / v_sum, 4)
+    else:
+        vwap_val = last_bar.get("vw")   # fallback
 
     price_vs_vwap = "n/a"
     vwap_dist_pct = 0.0
@@ -1485,6 +1493,26 @@ def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
         else:
             block_trade_signal = f"🐳 Block prints detected ({len(block_trades)} bars) — large player activity"
 
+    # ── Session high / low ────────────────────────────────────────────────────
+    session_high = round(max(b["h"] for b in bar_data), 4)
+    session_low  = round(min(b["l"] for b in bar_data), 4)
+
+    # ── Opening range (first 15 bars = first 15 minutes) ─────────────────────
+    # Shows where price opened and whether it has broken out of the early range.
+    # Meaningful for equities (RTH open) and highly liquid futures.
+    or_high = or_low = None
+    or_status = ""
+    if len(bar_data) >= 15:
+        or_bars   = bar_data[:15]
+        or_high   = round(max(b["h"] for b in or_bars), 4)
+        or_low    = round(min(b["l"] for b in or_bars), 4)
+        if current_px > or_high:
+            or_status = f"above OR high ({or_low}–{or_high}) ↑ bullish breakout"
+        elif current_px < or_low:
+            or_status = f"below OR low ({or_low}–{or_high}) ↓ bearish breakout"
+        else:
+            or_status = f"inside OR ({or_low}–{or_high}) — no breakout yet"
+
     # ── Market structure from swing highs/lows (last 30 bars) ────────────────
     window    = bar_data[-30:] if len(bar_data) >= 30 else bar_data
     swg_highs: list = []
@@ -1526,6 +1554,12 @@ def _calc_rich_flow(bars: list, proxy_note: str = "") -> dict:
         "bar_streak":      bar_streak,
         "vol_spike":       vol_spike,
         "block_trade":     block_trade_signal,
+        # Session levels
+        "session_high":    session_high,
+        "session_low":     session_low,
+        "or_high":         or_high,
+        "or_low":          or_low,
+        "or_status":       or_status,
         # Structure
         "mkt_structure":   mkt_structure,
         "key_resistance":  key_resistance,
@@ -2245,6 +2279,12 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
         kr = poly_flow.get("key_resistance"); ks = poly_flow.get("key_support")
         if kr and ks:
             parts.append(f"Key S/R from swings: support {ks} | resistance {kr}")
+        s_hi2 = poly_flow.get("session_high"); s_lo2 = poly_flow.get("session_low")
+        if s_hi2 and s_lo2:
+            parts.append(f"Session high/low: {s_lo2} – {s_hi2}")
+        or_st2 = poly_flow.get("or_status", "")
+        if or_st2:
+            parts.append(f"Opening range (15-min): {or_st2}")
         for ev_key in ("block_trade", "delta_flip", "exhaustion", "absorption", "imbalance", "bar_streak"):
             ev = poly_flow.get(ev_key, "")
             if ev:
@@ -2928,6 +2968,16 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         vol_spike = poly_flow.get("vol_spike")
         if vol_spike and vol_spike >= 1.5:
             poly_lines.append(f"  Vol Spike:  {vol_spike}× average ⚡")
+
+        # ── Session levels ────────────────────────────────────────────────────
+        s_hi = poly_flow.get("session_high")
+        s_lo = poly_flow.get("session_low")
+        if s_hi is not None and s_lo is not None:
+            poly_lines.append(f"  Session:    {s_lo} – {s_hi}  (H/L)")
+
+        or_st = poly_flow.get("or_status", "")
+        if or_st:
+            poly_lines.append(f"  Open Rng:   {or_st}")
 
         # ── Structure ────────────────────────────────────────────────────────
         mkt = poly_flow.get("mkt_structure", "")
