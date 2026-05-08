@@ -1904,11 +1904,14 @@ def refresh_price_cache():
 
                 # Polygon real order flow — overrides yfinance OHLC approximation
                 # when available. Falls back silently if key missing or API fails.
+                # 13-second pause between calls keeps us under the ~5 req/min
+                # rate limit so all 7 assets get real data every run.
                 if POLYGON_KEY and symbol in POLYGON_SYMBOLS:
                     poly_flow = fetch_polygon_order_flow(symbol)
                     if poly_flow:
                         data["order_flow"]   = poly_flow   # replaces yfinance approx
                         data["polygon_flow"] = poly_flow   # also store separately
+                    time.sleep(13)   # rate limit: ~5 req/min → 1 per 13s = safe
 
             _price_cache[symbol] = data
         time.sleep(0.3)
