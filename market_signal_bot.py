@@ -2648,19 +2648,29 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
             sl   = price * 0.99
             risk = price - sl
 
-        min_tp = price + risk          # floor: 1:1 minimum
+        min_tp = price + risk * 1.5    # floor: 1.5R minimum — ensures worthwhile R/R
         max_tp = price + risk * 4.0    # ceiling: 4R cap
 
-        # ── TP pool: Polygon levels first (magnets), then yfinance S/R ───────
-        # Applied with small buf so we don't target right at a level (fill risk)
-        tp_pool = sorted(
-            [lvl - buf for lvl in [vpoc, vwap, vah, or_hi, r15, p_res, rd, s_hi]
-             if lvl is not None and (lvl - buf) >= min_tp and (lvl - buf) <= max_tp],
-        )
+        # ── Two-tier TP selection ─────────────────────────────────────────────
+        # Tier 1 — Polygon magnets (VPOC, VWAP, VAH/VAL): highest probability
+        #   targets because they represent where real volume/interest sits.
+        #   Picked first regardless of distance vs structural levels.
+        # Tier 2 — Structural S/R (OR high, swing, daily, session): picked as
+        #   TP1 fallback and TP2 extension.
+        magnet_tp = sorted([
+            lvl - buf for lvl in [vpoc, vwap, vah]
+            if lvl is not None and (lvl - buf) >= min_tp and (lvl - buf) <= max_tp
+        ])
+        struct_tp = sorted([
+            lvl - buf for lvl in [or_hi, r15, p_res, rd, s_hi]
+            if lvl is not None and (lvl - buf) >= min_tp and (lvl - buf) <= max_tp
+        ])
+        all_tp = magnet_tp + [t for t in struct_tp if t not in magnet_tp]
 
-        tp1 = tp_pool[0] if tp_pool else (price + risk * 1.5)
-        # TP2: next level in pool above TP1, else 2.5R extension
-        tp2_pool = [t for t in tp_pool if t > tp1 * 1.003]
+        # TP1: best magnet first, else nearest structural, else 1.5R hard fallback
+        tp1 = magnet_tp[0] if magnet_tp else (struct_tp[0] if struct_tp else price + risk * 1.5)
+        # TP2: next level beyond TP1 from either pool, else 2.5R
+        tp2_pool = sorted([t for t in all_tp if t > tp1 * 1.003])
         tp2      = tp2_pool[0] if tp2_pool else min(price + risk * 2.5, max_tp)
 
         if tp2 > tp1 * 1.003:
@@ -2688,18 +2698,22 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
         sl   = price * 1.01
         risk = sl - price
 
-    min_tp = price - risk          # floor: 1:1 minimum (going down)
+    min_tp = price - risk * 1.5    # floor: 1.5R minimum — ensures worthwhile R/R
     max_tp = price - risk * 4.0    # ceiling: 4R cap (going down)
 
-    # ── TP pool: Polygon levels first, then yfinance S/R ─────────────────────
-    tp_pool = sorted(
-        [lvl + buf for lvl in [vpoc, vwap, val, or_lo, s15, p_sup, sd, s_lo]
-         if lvl is not None and (lvl + buf) <= min_tp and (lvl + buf) >= max_tp],
-        reverse=True,   # highest first = nearest to price for SELL
-    )
+    # ── Two-tier TP selection (mirror of BUY) ─────────────────────────────────
+    magnet_tp = sorted([
+        lvl + buf for lvl in [vpoc, vwap, val]
+        if lvl is not None and (lvl + buf) <= min_tp and (lvl + buf) >= max_tp
+    ], reverse=True)   # highest = nearest to price for SELL
+    struct_tp = sorted([
+        lvl + buf for lvl in [or_lo, s15, p_sup, sd, s_lo]
+        if lvl is not None and (lvl + buf) <= min_tp and (lvl + buf) >= max_tp
+    ], reverse=True)
+    all_tp = magnet_tp + [t for t in struct_tp if t not in magnet_tp]
 
-    tp1 = tp_pool[0] if tp_pool else (price - risk * 1.5)
-    tp2_pool = [t for t in tp_pool if t < tp1 * 0.997]
+    tp1 = magnet_tp[0] if magnet_tp else (struct_tp[0] if struct_tp else price - risk * 1.5)
+    tp2_pool = sorted([t for t in all_tp if t < tp1 * 0.997], reverse=True)
     tp2      = tp2_pool[0] if tp2_pool else max(price - risk * 2.5, max_tp)
 
     if tp1 > tp2 * 1.003:
