@@ -607,6 +607,15 @@ def signal_confidence(data: dict, bias: str):
         total += 1
         score += 1
 
+    # 19b. Short volume direction — intraday short sale ratio
+    #   SELL: heavy short volume (>55%) = active bearish pressure, agrees with SELL
+    #   BUY:  light short volume (<40%) = bears stepping back, agrees with BUY
+    svr = short.get("short_vol_ratio")
+    if svr is not None:
+        total += 1
+        if bias == "SELL" and svr > 55: score += 1
+        elif bias == "BUY"  and svr < 40: score += 1
+
     # 20. Pre-market / after-hours gap direction
     pm       = data.get("premarket_data") or {}
     gap_bias = pm.get("gap_bias", "")
@@ -2752,9 +2761,14 @@ def fetch_treasury_yields(memory: dict) -> dict:
 # SHORT DATA
 # ─────────────────────────────
 def fetch_short_data(symbol: str, memory: dict) -> dict:
-    """Fetch short interest data for SPY/QQQ from Polygon.
+    """Fetch short interest + daily short volume for SPY/QQQ from Polygon.
 
-    Returns days-to-cover, short float %, and squeeze setup flag.
+    Two calls per refresh (same 6-hour cache):
+      /stocks/v1/short-interest → bi-weekly DTC + short float %
+      /stocks/v1/short-volume   → today's intraday short sale volume ratio
+        short_vol_ratio > 55% = heavy shorting (bearish pressure)
+        short_vol_ratio < 40% = light shorting (low supply side pressure)
+    Returns days-to-cover, short float %, short volume ratio, squeeze flag.
     """
     if not POLYGON_KEY:
         return {}
@@ -2803,11 +2817,49 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
             if outstanding and shares_short:
                 short_float_pct = round(shares_short / outstanding * 100, 2)
 
-        # Squeeze score: 0-3
+        # ── Short volume (today's intraday short sale ratio) ─────────────────
+        # Distinct from short interest: this is the % of TODAY's volume that
+        # is short selling. Resets daily. High ratio = active bear pressure NOW.
+        short_vol_ratio    = None
+        short_vol_label    = ""
+        try:
+            from datetime import date as _sv_date
+            today_str = _sv_date.today().isoformat()
+            sv_resp = requests.get(
+                "https://api.massive.com/stocks/v1/short-volume",
+                params={"ticker": poly_sym, "date": today_str,
+                        "limit": 1, "apiKey": POLYGON_KEY},
+                timeout=10,
+            )
+            if sv_resp.status_code == 200:
+                sv_results = sv_resp.json().get("results") or []
+                if sv_results:
+                    sv = sv_results[0]
+                    sv_short = (sv.get("short_volume") or
+                                sv.get("shortVolume") or 0)
+                    sv_total = (sv.get("total_volume") or
+                                sv.get("totalVolume") or 0)
+                    if sv_total > 0 and sv_short > 0:
+                        short_vol_ratio = round(sv_short / sv_total * 100, 1)
+                        if short_vol_ratio > 55:
+                            short_vol_label = (f"Heavy shorting today "
+                                               f"({short_vol_ratio}% of volume) — bearish supply pressure")
+                        elif short_vol_ratio < 40:
+                            short_vol_label = (f"Light shorting today "
+                                               f"({short_vol_ratio}% of volume) — bears stepping back")
+                        else:
+                            short_vol_label = f"Neutral short volume ({short_vol_ratio}%)"
+        except Exception as sv_err:
+            print(f"  Short volume fetch failed (non-fatal): {sv_err}")
+
+        # Squeeze score: 0-4
         squeeze_score = 0
         if days_to_cover and days_to_cover > 3:
             squeeze_score += 1
         if short_float_pct and short_float_pct > 5:
+            squeeze_score += 1
+        # High short volume on a rising day = classic squeeze pressure
+        if short_vol_ratio and short_vol_ratio > 55:
             squeeze_score += 1
 
         # Check if price is above 5-day average using cached price data
@@ -2829,12 +2881,14 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
                 short_label = f"Low short interest ({days_to_cover:.1f} DTC)"
 
         data = {
-            "shares_short":    shares_short,
-            "days_to_cover":   days_to_cover,
-            "short_float_pct": short_float_pct,
-            "squeeze_score":   squeeze_score,
-            "squeeze_setup":   squeeze_setup,
-            "short_label":     short_label,
+            "shares_short":     shares_short,
+            "days_to_cover":    days_to_cover,
+            "short_float_pct":  short_float_pct,
+            "short_vol_ratio":  short_vol_ratio,
+            "short_vol_label":  short_vol_label,
+            "squeeze_score":    squeeze_score,
+            "squeeze_setup":    squeeze_setup,
+            "short_label":      short_label,
         }
         short_cache[cache_key] = {
             "fetched_at": now_utc().isoformat(),
@@ -2842,7 +2896,8 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
         }
         result = dict(data)
         result["fetched_fresh"] = True
-        print(f"  Short data fetched for {poly_sym}: DTC={days_to_cover}, squeeze={squeeze_setup}")
+        print(f"  Short data fetched for {poly_sym}: DTC={days_to_cover}, "
+              f"short_vol={short_vol_ratio}%, squeeze={squeeze_setup}")
         return result
 
     except Exception as e:
@@ -3049,11 +3104,18 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
             break
 
     # Short squeeze bonus — high short interest aligned with BUY
+    # Squeeze / short-volume bonus
+    # +5 for squeeze setup (high DTC + rising price = short squeeze risk)
+    # +3 for heavy intraday short volume on a bearish signal (bears piling in)
     squeeze_bonus = 0
     for d in moves.values():
         short = d.get("short_data") or {}
         if short.get("squeeze_setup"):
-            squeeze_bonus = 5
+            squeeze_bonus = max(squeeze_bonus, 5)
+        svr = short.get("short_vol_ratio")
+        if svr is not None and svr > 55:    # heavy shorting today = bearish conviction
+            squeeze_bonus = max(squeeze_bonus, 3)
+        if squeeze_bonus >= 5:
             break
 
     # Treasury yield macro bonus
@@ -3428,12 +3490,15 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
     # ── Short data context for AI ─────────────────────────────────────────────
     short_block = ""
     if short_data and (short_data.get("days_to_cover") is not None
-                       or short_data.get("short_float_pct") is not None):
+                       or short_data.get("short_vol_ratio") is not None):
         s_lines = ["━━━ SHORT DATA ━━━"]
-        s_lines.append(short_data.get("short_label", ""))
+        if short_data.get("short_label"):
+            s_lines.append(short_data["short_label"])
+        if short_data.get("short_vol_label"):
+            s_lines.append(short_data["short_vol_label"])
         if short_data.get("squeeze_setup"):
             s_lines.append(
-                "WARNING SQUEEZE SETUP: High short interest + price rising — potential short squeeze"
+                "⚠️ SQUEEZE SETUP: High short interest + rising price — potential short squeeze"
             )
         short_block = "\n" + "\n".join(l for l in s_lines if l)
 
@@ -4174,12 +4239,15 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
             opts_lines.append(f"  Gamma:     {opts['gamma_bias']}")
         options_section = "\n".join(opts_lines) + "\n\n"
 
-    # ── Short squeeze section ──────────────────────────────────────────────────
+    # ── Short data section (interest + intraday volume) ───────────────────────
     short_section = ""
     short = primary_data.get("short_data") or {}
-    if short.get("short_label"):
+    if short.get("short_label") or short.get("short_vol_label"):
         short_lines = ["📉 *Short Data:*"]
-        short_lines.append(f"  {short['short_label']}")
+        if short.get("short_label"):
+            short_lines.append(f"  {short['short_label']}")
+        if short.get("short_vol_label"):
+            short_lines.append(f"  {short['short_vol_label']}")
         if short.get("squeeze_setup"):
             short_lines.append("  🚨 SQUEEZE SETUP — high short float, price rising")
         short_section = "\n".join(short_lines) + "\n\n"
