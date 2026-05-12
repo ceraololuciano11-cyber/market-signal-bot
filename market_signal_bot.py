@@ -576,6 +576,45 @@ def signal_confidence(data: dict, bias: str):
         if bias == "BUY"  and "buyer absorption"  in absorption.lower(): score += 1
         elif bias == "SELL" and "seller absorption" in absorption.lower(): score += 1
 
+    # ── LAYER D: New supplementary data ──────────────────────────────────────
+
+    # 16. Options PCR directional bias
+    opts = data.get("options_flow") or {}
+    pcr  = opts.get("pcr")
+    if pcr is not None:
+        total += 1
+        if bias == "BUY"  and pcr < 0.7:  score += 1   # call-heavy = bullish options positioning
+        elif bias == "SELL" and pcr > 1.2: score += 1   # put-heavy = bearish options positioning
+
+    # 17. Unusual options activity direction
+    unusual_sum = opts.get("unusual_summary", "")
+    if unusual_sum and "both sides" not in unusual_sum.lower():
+        total += 1
+        if bias == "BUY"  and "call" in unusual_sum.lower(): score += 1
+        elif bias == "SELL" and "put"  in unusual_sum.lower(): score += 1
+
+    # 18. Treasury yield macro signal (equities only)
+    yields  = data.get("treasury_yields") or {}
+    eq_sig  = yields.get("equity_signal", "")
+    if eq_sig:
+        total += 1
+        if bias == "BUY"  and eq_sig == "bullish_equities": score += 1
+        elif bias == "SELL" and eq_sig == "bearish_equities": score += 1
+
+    # 19. Short squeeze setup (BUY signal on heavily shorted instrument)
+    short = data.get("short_data") or {}
+    if short.get("squeeze_setup") and bias == "BUY":
+        total += 1
+        score += 1
+
+    # 20. Pre-market / after-hours gap direction
+    pm       = data.get("premarket_data") or {}
+    gap_bias = pm.get("gap_bias", "")
+    if gap_bias and gap_bias != "neutral":
+        total += 1
+        if bias == "BUY"  and gap_bias == "bullish": score += 1
+        elif bias == "SELL" and gap_bias == "bearish": score += 1
+
     return score, total
 
 def confidence_bar(score: int, total: int) -> str:
@@ -2068,11 +2107,17 @@ def load_memory() -> dict:
     try:
         with open(MEMORY_FILE) as f:
             data = json.load(f)
-        data.setdefault("signals",         [])
-        data.setdefault("poly_hist_cache", {})
+        data.setdefault("signals",          [])
+        data.setdefault("poly_hist_cache",  {})
+        data.setdefault("options_cache",    {})
+        data.setdefault("yields_cache",     {})
+        data.setdefault("short_cache",      {})
+        data.setdefault("premarket_cache",  {})
         return data
     except Exception:
-        return {"signals": [], "poly_hist_cache": {}}
+        return {"signals": [], "poly_hist_cache": {},
+                "options_cache": {}, "yields_cache": {},
+                "short_cache": {}, "premarket_cache": {}}
 
 
 def save_memory(memory: dict):
@@ -2455,6 +2500,454 @@ def fetch_polygon_historical(symbol: str, memory: dict) -> dict:
 
 
 # ─────────────────────────────
+# OPTIONS FLOW
+# ─────────────────────────────
+def fetch_options_flow(symbol: str, memory: dict) -> dict:
+    """Fetch options chain snapshot for SPY/QQQ from Polygon.
+
+    Returns PCR, IV, unusual activity, and gamma exposure.
+    Only works for equity ETFs (SPY, QQQ) — commodity ETFs excluded.
+    """
+    if not POLYGON_KEY:
+        return {}
+    poly_sym = POLYGON_SYMBOLS.get(symbol, "")
+    if poly_sym not in ("SPY", "QQQ"):
+        return {}
+
+    options_cache = memory.setdefault("options_cache", {})
+    cache_key = f"{poly_sym}_options"
+    cached = options_cache.get(cache_key)
+    if cached:
+        try:
+            fetched_at = datetime.fromisoformat(cached["fetched_at"])
+            if (now_utc() - fetched_at) < timedelta(minutes=15):
+                result = dict(cached["data"])
+                result["fetched_fresh"] = False
+                return result
+        except Exception:
+            pass
+
+    try:
+        url  = f"https://api.massive.com/v3/snapshot/options/{poly_sym}"
+        resp = requests.get(url, params={"limit": 250, "order": "desc",
+                                          "sort": "open_interest", "apiKey": POLYGON_KEY},
+                            timeout=12)
+        if resp.status_code != 200:
+            return {}
+        results = resp.json().get("results") or []
+
+        total_call_oi = 0
+        total_put_oi  = 0
+        call_items    = []
+        put_items     = []
+
+        for item in results:
+            details = item.get("details") or {}
+            ctype   = (details.get("contract_type") or "").lower()
+            oi      = item.get("open_interest") or 0
+            vol     = (item.get("day") or {}).get("volume")
+            iv      = item.get("implied_volatility")
+            greeks  = item.get("greeks") or {}
+            delta   = greeks.get("delta")
+            gamma   = greeks.get("gamma")
+            strike  = details.get("strike_price") or 0
+
+            if ctype == "call":
+                total_call_oi += oi
+                call_items.append({"oi": oi, "vol": vol, "iv": iv, "gamma": gamma,
+                                   "delta": delta, "strike": strike})
+            elif ctype == "put":
+                total_put_oi += oi
+                put_items.append({"oi": oi, "vol": vol, "iv": iv, "gamma": gamma,
+                                  "delta": delta, "strike": strike})
+
+        # PCR
+        pcr = None
+        pcr_label = ""
+        if total_call_oi > 0:
+            pcr = round(total_put_oi / total_call_oi, 2)
+            if pcr < 0.6:
+                pcr_label = "extreme call buying (bullish sentiment)"
+            elif pcr < 0.8:
+                pcr_label = "call-heavy (bullish bias)"
+            elif pcr < 1.1:
+                pcr_label = "balanced"
+            elif pcr < 1.4:
+                pcr_label = "put-heavy (bearish bias)"
+            else:
+                pcr_label = "extreme put buying (bearish sentiment)"
+
+        # IV average from top 50 by OI
+        all_items_sorted = sorted(results, key=lambda x: x.get("open_interest") or 0, reverse=True)
+        iv_vals = [item.get("implied_volatility") for item in all_items_sorted[:50]
+                   if item.get("implied_volatility") is not None]
+        iv_avg = round(sum(iv_vals) / len(iv_vals), 4) if iv_vals else None
+
+        # Unusual activity
+        unusual_calls = []
+        for c in sorted(call_items, key=lambda x: x["oi"], reverse=True):
+            if c["vol"] is not None and c["oi"] > 0 and c["vol"] / c["oi"] > 1.5:
+                ratio = c["vol"] / c["oi"]
+                unusual_calls.append(f"Call {c['strike']} (vol/OI={ratio:.1f}x)")
+                if len(unusual_calls) >= 3:
+                    break
+
+        unusual_puts = []
+        for p in sorted(put_items, key=lambda x: x["oi"], reverse=True):
+            if p["vol"] is not None and p["oi"] > 0 and p["vol"] / p["oi"] > 1.5:
+                ratio = p["vol"] / p["oi"]
+                unusual_puts.append(f"Put {p['strike']} (vol/OI={ratio:.1f}x)")
+                if len(unusual_puts) >= 3:
+                    break
+
+        if unusual_calls and unusual_puts:
+            unusual_summary = "Unusual activity on BOTH sides — directional uncertainty"
+        elif unusual_calls:
+            unusual_summary = f"{len(unusual_calls)} unusual call sweeps (bullish positioning)"
+        elif unusual_puts:
+            unusual_summary = f"{len(unusual_puts)} unusual put sweeps (bearish positioning)"
+        else:
+            unusual_summary = ""
+
+        # Gamma exposure
+        net_gamma = 0.0
+        for c in call_items:
+            if c["gamma"] is not None:
+                net_gamma += c["gamma"] * c["oi"] * 100
+        for p in put_items:
+            if p["gamma"] is not None:
+                net_gamma -= p["gamma"] * p["oi"] * 100
+
+        if net_gamma > 0:
+            gamma_bias = "positive gamma (dealer hedging = dampens moves)"
+        elif net_gamma < 0:
+            gamma_bias = "negative gamma (dealer hedging = amplifies moves)"
+        else:
+            gamma_bias = ""
+
+        data = {
+            "total_call_oi":  total_call_oi,
+            "total_put_oi":   total_put_oi,
+            "pcr":            pcr,
+            "pcr_label":      pcr_label,
+            "iv_avg":         iv_avg,
+            "unusual_calls":  unusual_calls,
+            "unusual_puts":   unusual_puts,
+            "unusual_summary": unusual_summary,
+            "gamma_bias":     gamma_bias,
+            "net_gamma":      round(net_gamma, 2),
+        }
+        options_cache[cache_key] = {
+            "fetched_at": now_utc().isoformat(),
+            "data":       data,
+        }
+        result = dict(data)
+        result["fetched_fresh"] = True
+        print(f"  Options flow fetched for {poly_sym}: PCR={pcr}, IV={iv_avg}")
+        return result
+
+    except Exception as e:
+        print(f"  Options flow error ({symbol}): {e}")
+        return {}
+
+
+# ─────────────────────────────
+# TREASURY YIELDS
+# ─────────────────────────────
+def fetch_treasury_yields(memory: dict) -> dict:
+    """Fetch US Treasury yield curve from Polygon economy endpoint.
+
+    Returns 2Y, 10Y, 30Y yields and curve interpretation.
+    """
+    if not POLYGON_KEY:
+        return {}
+
+    yields_cache = memory.setdefault("yields_cache", {})
+    cached = yields_cache.get("yields")
+    if cached:
+        try:
+            fetched_at = datetime.fromisoformat(cached["fetched_at"])
+            if (now_utc() - fetched_at) < timedelta(minutes=60):
+                result = dict(cached["data"])
+                result["fetched_fresh"] = False
+                return result
+        except Exception:
+            pass
+
+    try:
+        url  = "https://api.massive.com/economy/v1/treasury-yields"
+        resp = requests.get(url, params={"apiKey": POLYGON_KEY}, timeout=12)
+        if resp.status_code != 200:
+            return {}
+        results = resp.json().get("results") or []
+        if not results:
+            return {}
+
+        # Most recent entry (last item)
+        entry = results[-1]
+
+        def _get_yield(d, *keys):
+            for k in keys:
+                v = d.get(k)
+                if v is not None:
+                    return float(v)
+            return None
+
+        y2  = _get_yield(entry, "2Y", "2y", "2_year")
+        y10 = _get_yield(entry, "10Y", "10y", "10_year")
+        y30 = _get_yield(entry, "30Y", "30y", "30_year")
+
+        spread_2_10 = None
+        curve_label = ""
+        equity_signal = ""
+        gold_signal   = ""
+
+        if y2 is not None and y10 is not None:
+            spread_2_10 = round(y10 - y2, 2)
+            if spread_2_10 < -0.5:
+                curve_label = "Deeply inverted (2y > 10y) — strong recession signal"
+            elif spread_2_10 < -0.1:
+                curve_label = "Mildly inverted — caution"
+            elif spread_2_10 < 0.3:
+                curve_label = "Flat — neutral"
+            else:
+                curve_label = "Normal/steep — growth expectations"
+
+            if spread_2_10 < -0.3 and y2 > 4.5:
+                equity_signal = "bearish_equities"
+            elif spread_2_10 > 0.5:
+                equity_signal = "bullish_equities"
+
+        if y10 is not None:
+            if y10 < 3.5 or (spread_2_10 is not None and spread_2_10 < -0.3):
+                gold_signal = "bullish_gold"
+            elif y10 > 5.0:
+                gold_signal = "bearish_gold"
+
+        data = {
+            "y2":           y2,
+            "y10":          y10,
+            "y30":          y30,
+            "spread_2_10":  spread_2_10,
+            "curve_label":  curve_label,
+            "equity_signal": equity_signal,
+            "gold_signal":  gold_signal,
+            "date":         entry.get("date", ""),
+        }
+        yields_cache["yields"] = {
+            "fetched_at": now_utc().isoformat(),
+            "data":       data,
+        }
+        result = dict(data)
+        result["fetched_fresh"] = True
+        print(f"  Treasury yields fetched: 2Y={y2}, 10Y={y10}, spread={spread_2_10}")
+        return result
+
+    except Exception as e:
+        print(f"  Treasury yields error: {e}")
+        return {}
+
+
+# ─────────────────────────────
+# SHORT DATA
+# ─────────────────────────────
+def fetch_short_data(symbol: str, memory: dict) -> dict:
+    """Fetch short interest data for SPY/QQQ from Polygon.
+
+    Returns days-to-cover, short float %, and squeeze setup flag.
+    """
+    if not POLYGON_KEY:
+        return {}
+    poly_sym = POLYGON_SYMBOLS.get(symbol, "")
+    if poly_sym not in ("SPY", "QQQ"):
+        return {}
+
+    short_cache = memory.setdefault("short_cache", {})
+    cache_key = f"{poly_sym}_short"
+    cached = short_cache.get(cache_key)
+    if cached:
+        try:
+            fetched_at = datetime.fromisoformat(cached["fetched_at"])
+            if (now_utc() - fetched_at) < timedelta(hours=6):
+                result = dict(cached["data"])
+                result["fetched_fresh"] = False
+                return result
+        except Exception:
+            pass
+
+    try:
+        url  = f"https://api.massive.com/stocks/v1/short-interest"
+        resp = requests.get(url, params={"ticker": poly_sym, "limit": 2,
+                                          "apiKey": POLYGON_KEY}, timeout=12)
+        if resp.status_code != 200:
+            return {}
+        results = resp.json().get("results") or []
+        if not results:
+            return {}
+
+        entry = results[0]
+
+        # Flexible field name handling
+        shares_short = (entry.get("short_interest") or
+                        entry.get("shares_short") or 0)
+        avg_vol      = (entry.get("avg_daily_share_volume") or
+                        entry.get("avg_daily_volume") or 0)
+
+        days_to_cover = None
+        if shares_short and avg_vol:
+            days_to_cover = round(shares_short / avg_vol, 1)
+
+        short_float_pct = entry.get("percent_float")
+        if short_float_pct is None:
+            outstanding = entry.get("outstanding_shares")
+            if outstanding and shares_short:
+                short_float_pct = round(shares_short / outstanding * 100, 2)
+
+        # Squeeze score: 0-3
+        squeeze_score = 0
+        if days_to_cover and days_to_cover > 3:
+            squeeze_score += 1
+        if short_float_pct and short_float_pct > 5:
+            squeeze_score += 1
+
+        # Check if price is above 5-day average using cached price data
+        price_data = _price_cache.get(symbol) or {}
+        price = price_data.get("price")
+        ema5  = price_data.get("ema20")  # proxy: if price > ema20, rising
+        if price and ema5 and price > ema5:
+            squeeze_score += 1
+
+        squeeze_setup = squeeze_score >= 2
+
+        short_label = ""
+        if days_to_cover is not None:
+            if days_to_cover > 5:
+                short_label = f"High short interest ({days_to_cover:.1f} DTC) — squeeze risk"
+            elif days_to_cover > 2:
+                short_label = f"Moderate short interest ({days_to_cover:.1f} DTC)"
+            else:
+                short_label = f"Low short interest ({days_to_cover:.1f} DTC)"
+
+        data = {
+            "shares_short":    shares_short,
+            "days_to_cover":   days_to_cover,
+            "short_float_pct": short_float_pct,
+            "squeeze_score":   squeeze_score,
+            "squeeze_setup":   squeeze_setup,
+            "short_label":     short_label,
+        }
+        short_cache[cache_key] = {
+            "fetched_at": now_utc().isoformat(),
+            "data":       data,
+        }
+        result = dict(data)
+        result["fetched_fresh"] = True
+        print(f"  Short data fetched for {poly_sym}: DTC={days_to_cover}, squeeze={squeeze_setup}")
+        return result
+
+    except Exception as e:
+        print(f"  Short data error ({symbol}): {e}")
+        return {}
+
+
+# ─────────────────────────────
+# PRE-MARKET / AFTER-HOURS
+# ─────────────────────────────
+def fetch_premarket_data(symbol: str, memory: dict) -> dict:
+    """Fetch previous day's open/close and after-hours/pre-market data.
+
+    Returns gap analysis vs previous close.
+    """
+    if not POLYGON_KEY:
+        return {}
+    poly_sym = POLYGON_SYMBOLS.get(symbol, "")
+    if not poly_sym:
+        return {}
+
+    premarket_cache = memory.setdefault("premarket_cache", {})
+    cache_key = f"{poly_sym}_premarket"
+    cached = premarket_cache.get(cache_key)
+    if cached:
+        try:
+            fetched_at = datetime.fromisoformat(cached["fetched_at"])
+            if (now_utc() - fetched_at) < timedelta(minutes=30):
+                result = dict(cached["data"])
+                result["fetched_fresh"] = False
+                return result
+        except Exception:
+            pass
+
+    try:
+        from datetime import date as _date_cls
+        yesterday = _date_cls.today() - timedelta(days=1)
+        # Skip Sunday → use Friday
+        if yesterday.weekday() == 6:
+            yesterday = yesterday - timedelta(days=2)
+        # Skip Saturday → use Friday
+        elif yesterday.weekday() == 5:
+            yesterday = yesterday - timedelta(days=1)
+        yesterday_str = yesterday.isoformat()
+
+        url  = f"https://api.massive.com/v1/open-close/{poly_sym}/{yesterday_str}"
+        resp = requests.get(url, params={"adjusted": "true", "apiKey": POLYGON_KEY},
+                            timeout=12)
+        if resp.status_code != 200:
+            return {}
+        body = resp.json()
+
+        prev_close   = body.get("close")
+        after_hours  = body.get("afterHours")
+        pre_market   = body.get("preMarket")
+
+        ah_change_pct = None
+        pm_change_pct = None
+        if prev_close and prev_close > 0:
+            if after_hours is not None:
+                ah_change_pct = round((after_hours - prev_close) / prev_close * 100, 2)
+            if pre_market is not None:
+                pm_change_pct = round((pre_market - prev_close) / prev_close * 100, 2)
+
+        gap_note_parts = []
+        if ah_change_pct is not None and abs(ah_change_pct) > 0.5:
+            gap_note_parts.append(f"After-hours: {ah_change_pct:+.2f}% vs prev close")
+        if pm_change_pct is not None and abs(pm_change_pct) > 0.3:
+            gap_note_parts.append(f"Pre-market: {pm_change_pct:+.2f}%")
+        gap_note = " | ".join(gap_note_parts)
+
+        # Determine gap bias from the most recent extended-hours price
+        gap_value = pm_change_pct if pm_change_pct is not None else ah_change_pct
+        if gap_value is not None and gap_value > 0.5:
+            gap_bias = "bullish"
+        elif gap_value is not None and gap_value < -0.5:
+            gap_bias = "bearish"
+        else:
+            gap_bias = "neutral"
+
+        data = {
+            "prev_close":     prev_close,
+            "after_hours":    after_hours,
+            "pre_market":     pre_market,
+            "ah_change_pct":  ah_change_pct,
+            "pm_change_pct":  pm_change_pct,
+            "gap_note":       gap_note,
+            "gap_bias":       gap_bias,
+            "date":           yesterday_str,
+        }
+        premarket_cache[cache_key] = {
+            "fetched_at": now_utc().isoformat(),
+            "data":       data,
+        }
+        result = dict(data)
+        result["fetched_fresh"] = True
+        print(f"  Pre-market data fetched for {poly_sym}: gap_bias={gap_bias}")
+        return result
+
+    except Exception as e:
+        print(f"  Pre-market data error ({symbol}): {e}")
+        return {}
+
+
+# ─────────────────────────────
 # SIGNAL COOLDOWN
 # ─────────────────────────────
 def cooldown_active(symbol: str, cooldowns: dict) -> bool:
@@ -2542,9 +3035,40 @@ def score_signal(title: str, moves: dict, signal_type: str, src_count: int = 1):
             polygon_bonus = min(polygon_bonus, 20)                    # cap at 20
             break
 
+    # Options flow bonus — strong PCR extreme + unusual activity
+    options_bonus = 0
+    for d in moves.values():
+        opts = d.get("options_flow") or {}
+        if opts.get("pcr") is not None:
+            pcr = opts["pcr"]
+            if pcr < 0.6 or pcr > 1.5:        # extreme positioning
+                options_bonus += 4
+            if opts.get("unusual_summary"):    # unusual activity detected
+                options_bonus += 3
+            options_bonus = min(options_bonus, 8)
+            break
+
+    # Short squeeze bonus — high short interest aligned with BUY
+    squeeze_bonus = 0
+    for d in moves.values():
+        short = d.get("short_data") or {}
+        if short.get("squeeze_setup"):
+            squeeze_bonus = 5
+            break
+
+    # Treasury yield macro bonus
+    yields_bonus = 0
+    for d in moves.values():
+        yields = d.get("treasury_yields") or {}
+        eq_sig = yields.get("equity_signal", "")
+        if eq_sig:
+            yields_bonus = 4
+            break
+
     total = min(100, freshness + macro_bonus + energy_bonus
                      + analysis_bonus + breadth_bonus + source_bonus
-                     + vol_bonus + delta_bonus + polygon_bonus)
+                     + vol_bonus + delta_bonus + polygon_bonus
+                     + options_bonus + squeeze_bonus + yields_bonus)
     return total, reaction
 
 def label(s: int) -> str:
@@ -2816,6 +3340,108 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
                 h_lines.append(f"Historical S/R zones: {kl_str}")
             hist_block = "\n" + "\n".join(h_lines)
 
+    # ── Fetch new supplementary data ─────────────────────────────────────────
+    # Fetched here so they're available for the AI prompt AND signal_confidence().
+    # Each result is stored on primary_data so downstream callers can see them.
+    options_data   = {}
+    yields_data    = {}
+    short_data     = {}
+    premarket_data = {}
+
+    if POLYGON_KEY and primary_symbol and primary_data:
+        # Options flow (SPY/QQQ only)
+        options_data = fetch_options_flow(primary_symbol, memory)
+        if options_data.get("fetched_fresh"):
+            time.sleep(2)
+        if options_data:
+            primary_data["options_flow"] = options_data
+            if primary_symbol in _price_cache:
+                _price_cache[primary_symbol]["options_flow"] = options_data
+
+        # Treasury yields (global, any symbol)
+        yields_data = fetch_treasury_yields(memory)
+        if yields_data.get("fetched_fresh"):
+            time.sleep(2)
+        if yields_data:
+            primary_data["treasury_yields"] = yields_data
+            if primary_symbol in _price_cache:
+                _price_cache[primary_symbol]["treasury_yields"] = yields_data
+
+        # Short data (SPY/QQQ only)
+        short_data = fetch_short_data(primary_symbol, memory)
+        if short_data.get("fetched_fresh"):
+            time.sleep(2)
+        if short_data:
+            primary_data["short_data"] = short_data
+            if primary_symbol in _price_cache:
+                _price_cache[primary_symbol]["short_data"] = short_data
+
+        # Pre-market / after-hours
+        premarket_data = fetch_premarket_data(primary_symbol, memory)
+        if premarket_data.get("fetched_fresh"):
+            time.sleep(2)
+        if premarket_data:
+            primary_data["premarket_data"] = premarket_data
+            if primary_symbol in _price_cache:
+                _price_cache[primary_symbol]["premarket_data"] = premarket_data
+
+    # ── Options context for AI ────────────────────────────────────────────────
+    options_block = ""
+    if options_data and options_data.get("pcr") is not None:
+        o_lines = ["━━━ OPTIONS MARKET (Polygon live chain) ━━━"]
+        o_lines.append(f"Put/Call Ratio: {options_data['pcr']:.2f} — {options_data.get('pcr_label', '')}")
+        if options_data.get("iv_avg"):
+            o_lines.append(
+                f"Implied Volatility (avg): {options_data['iv_avg']:.1%} — "
+                f"market pricing in {options_data['iv_avg'] * 100:.1f}% annual move"
+            )
+        if options_data.get("unusual_summary"):
+            o_lines.append(f"Unusual activity: {options_data['unusual_summary']}")
+        if options_data.get("unusual_calls"):
+            o_lines.append(f"Notable calls: {', '.join(options_data['unusual_calls'][:3])}")
+        if options_data.get("unusual_puts"):
+            o_lines.append(f"Notable puts: {', '.join(options_data['unusual_puts'][:3])}")
+        if options_data.get("gamma_bias"):
+            o_lines.append(f"Gamma exposure: {options_data['gamma_bias']}")
+        options_block = "\n" + "\n".join(o_lines)
+
+    # ── Treasury yields context for AI ───────────────────────────────────────
+    yields_block = ""
+    if yields_data and yields_data.get("y10") is not None:
+        y_lines = ["━━━ TREASURY YIELDS (macro context) ━━━"]
+        y2  = yields_data.get("y2")
+        y10 = yields_data.get("y10")
+        y30 = yields_data.get("y30")
+        if y2 and y10:
+            y30_part = f" | 30Y: {y30:.2f}%" if y30 else ""
+            y_lines.append(f"2Y: {y2:.2f}% | 10Y: {y10:.2f}%{y30_part}")
+            y_lines.append(
+                f"2Y-10Y spread: {yields_data['spread_2_10']:+.2f}% — "
+                f"{yields_data.get('curve_label', '')}"
+            )
+        if yields_data.get("equity_signal"):
+            y_lines.append(f"Equity signal: {yields_data['equity_signal'].replace('_', ' ')}")
+        if yields_data.get("gold_signal"):
+            y_lines.append(f"Gold signal: {yields_data['gold_signal'].replace('_', ' ')}")
+        yields_block = "\n" + "\n".join(y_lines)
+
+    # ── Short data context for AI ─────────────────────────────────────────────
+    short_block = ""
+    if short_data and (short_data.get("days_to_cover") is not None
+                       or short_data.get("short_float_pct") is not None):
+        s_lines = ["━━━ SHORT DATA ━━━"]
+        s_lines.append(short_data.get("short_label", ""))
+        if short_data.get("squeeze_setup"):
+            s_lines.append(
+                "WARNING SQUEEZE SETUP: High short interest + price rising — potential short squeeze"
+            )
+        short_block = "\n" + "\n".join(l for l in s_lines if l)
+
+    # ── Pre-market context for AI ─────────────────────────────────────────────
+    pm_block = ""
+    if premarket_data and premarket_data.get("gap_note"):
+        pm_block = f"\n━━━ PRE-MARKET / AFTER-HOURS ━━━\n{premarket_data['gap_note']}"
+
     # ── Memory lessons digest ─────────────────────────────────────────────────
     lessons_str  = build_lessons_digest(memory, primary_symbol) if memory else ""
     memory_block = f"\n\n━━━ BOT LEARNING (past signal outcomes) ━━━\n{lessons_str}" if lessons_str else ""
@@ -2842,6 +3468,10 @@ High-impact events today: {cal_str}
 {macro_note}
 {polygon_context}
 {hist_block}
+{options_block}
+{yields_block}
+{short_block}
+{pm_block}
 {memory_block}
 
 ━━━ OTHER INSTRUMENTS (context) ━━━
@@ -2862,6 +3492,8 @@ Analyze this headline for {prim_name}. Synthesize ALL data above — especially 
    Conflicting order flow MUST lower IMPACT. Aligned order flow MUST raise IMPACT.
 4. LOCATION: Is price at a favourable entry (discount for BUY, premium for SELL)? VPOC, VAH/VAL, S/R levels? Historical key zones?
 5. HISTORICAL: Does the 52-week context support this trade? Is price near a major historical level?
+5b. OPTIONS: If options data is present, use PCR and unusual activity to confirm or contradict the bias. Extreme PCR = strong sentiment signal. Unusual activity = smart money positioning.
+5c. SHORT SQUEEZE: If squeeze setup is present and bias is BUY, flag as high conviction. If squeeze setup but bias is SELL, warn it could reverse sharply.
 6. PAST PERFORMANCE: If signal memory is provided, use the win-rate patterns to calibrate your IMPACT rating. High-confidence signals with historically predictive indicators should be rated higher.
 7. RISK: The single biggest reason this trade fails.
 
@@ -3096,10 +3728,19 @@ def compute_trade_levels(bias: str, primary_data: dict,
     h_key_res = next((kl["price"] for kl in hist_key_levels if kl["type"] == "R"), None)
     h_key_sup = next((kl["price"] for kl in hist_key_levels if kl["type"] == "S"), None)
 
+    # ── IV-aware stop sizing ─────────────────────────────────────────────────
+    # If options data shows high implied volatility, widen stops so they're
+    # not clipped by normal volatility noise.
+    iv_avg       = (primary_data.get("options_flow") or {}).get("iv_avg")
+    iv_multiplier = 1.0
+    if iv_avg is not None:
+        if iv_avg > 0.40:   iv_multiplier = 1.35   # very high IV → much wider stops
+        elif iv_avg > 0.25: iv_multiplier = 1.15   # elevated IV → slightly wider stops
+
     # ── ATR-aware buffer ─────────────────────────────────────────────────────
     # At least 0.15% of price, scales with volatility so stops breathe in
     # fast-moving markets (futures, volatile ETFs) without being reckless.
-    buf = max(price * 0.0015, (atr * 0.5) if atr else 0)
+    buf = max(price * 0.0015, (atr * 0.5) if atr else 0) * iv_multiplier
 
     # ── Decimal precision ─────────────────────────────────────────────────────
     if   price >= 1000: dec = 1
@@ -3519,6 +4160,51 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         if h_lines:
             hist_section = "📅 *Historical context (2yr):*\n" + "\n".join(h_lines) + "\n\n"
 
+    # ── Options flow section ───────────────────────────────────────────────────
+    options_section = ""
+    opts = primary_data.get("options_flow") or {}
+    if opts.get("pcr") is not None:
+        opts_lines = ["📊 *Options Market:*"]
+        opts_lines.append(f"  P/C Ratio: {opts['pcr']:.2f} — {opts.get('pcr_label', '')}")
+        if opts.get("iv_avg"):
+            opts_lines.append(f"  Impl. Vol:  {opts['iv_avg']:.1%}")
+        if opts.get("unusual_summary"):
+            opts_lines.append(f"  ⚡ {opts['unusual_summary']}")
+        if opts.get("gamma_bias"):
+            opts_lines.append(f"  Gamma:     {opts['gamma_bias']}")
+        options_section = "\n".join(opts_lines) + "\n\n"
+
+    # ── Short squeeze section ──────────────────────────────────────────────────
+    short_section = ""
+    short = primary_data.get("short_data") or {}
+    if short.get("short_label"):
+        short_lines = ["📉 *Short Data:*"]
+        short_lines.append(f"  {short['short_label']}")
+        if short.get("squeeze_setup"):
+            short_lines.append("  🚨 SQUEEZE SETUP — high short float, price rising")
+        short_section = "\n".join(short_lines) + "\n\n"
+
+    # ── Pre-market / after-hours section ─────────────────────────────────────
+    premarket_section = ""
+    pm = primary_data.get("premarket_data") or {}
+    if pm.get("gap_note"):
+        premarket_section = f"🌅 *Extended Hours:*\n  {pm['gap_note']}\n\n"
+
+    # ── Treasury yields section (for equities) ────────────────────────────────
+    yields_section = ""
+    yields = primary_data.get("treasury_yields") or {}
+    if yields.get("y10") is not None and primary_symbol in ("^GSPC", "QQQ"):
+        y_lines = ["📈 *Treasury Yields:*"]
+        y2  = yields.get("y2")
+        y10 = yields.get("y10")
+        if y2 and y10:
+            y_lines.append(
+                f"  2Y: {y2:.2f}% | 10Y: {y10:.2f}% | "
+                f"Spread: {yields.get('spread_2_10', 0):+.2f}%"
+            )
+            y_lines.append(f"  Curve: {yields.get('curve_label', '')}")
+        yields_section = "\n".join(y_lines) + "\n\n"
+
     # ── Memory / past performance section ─────────────────────────────────────
     memory_section = ""
     if memory and bias in ("BUY", "SELL"):
@@ -3682,6 +4368,10 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         f"{fourh_section}"
         f"{daily_section}"
         f"{hist_section}"
+        f"{options_section}"
+        f"{short_section}"
+        f"{premarket_section}"
+        f"{yields_section}"
         f"{memory_section}"
         f"🎯 *Assets affected:*\n{sanitize(ai['AFFECTS'])}\n\n"
         f"👀 *Watch for:*\n{sanitize(ai['WATCH'])}\n\n"
@@ -3980,7 +4670,7 @@ def maybe_send_price_alerts(state: dict):
 # ─────────────────────────────
 # MORNING RECAP  (06:30 Zürich)
 # ─────────────────────────────
-def send_morning_recap(state: dict) -> bool:
+def send_morning_recap(state: dict, memory: dict = None) -> bool:
     """Morning brief — fires once at 06:30 Zürich.
 
     Two modes:
@@ -4059,6 +4749,24 @@ def send_morning_recap(state: dict) -> bool:
     vix = _price_cache.get("^VIX")
     fear_str = f"VIX: {vix['price']} ({vix_label(vix['price'])})" if vix and vix.get("price") else "n/a"
 
+    # ── 4b. Treasury yields context ──────────────────────────────────────────
+    yields_ctx = ""
+    if POLYGON_KEY:
+        try:
+            yields_data = fetch_treasury_yields(memory or {})
+            if yields_data and yields_data.get("y10") is not None:
+                y2  = yields_data.get("y2")
+                y10 = yields_data.get("y10")
+                yields_ctx = (
+                    f"\n\nTreasury Yields: "
+                    + (f"2Y={y2:.2f}% | " if y2 else "")
+                    + f"10Y={y10:.2f}% | "
+                    + f"Spread: {yields_data.get('spread_2_10', 0):+.2f}% "
+                    + f"({yields_data.get('curve_label', '')})"
+                )
+        except Exception as e:
+            print(f"  Yields fetch in recap failed (non-fatal): {e}")
+
     # ── 5. AI brief ──────────────────────────────────────────────────────────
     if is_weekend_day:
         task_prompt = """Write a sharp weekend brief for a trader watching futures and indices. Cover:
@@ -4085,7 +4793,7 @@ Current Zürich time: {zh.strftime('%H:%M on %A %d %b')} | Scope: {scope_label}
 {headlines_str}
 
 ━━━ MARKET SENTIMENT ━━━
-{fear_str}
+{fear_str}{yields_ctx}
 
 ━━━ YOUR TASK ━━━
 {task_prompt}
@@ -4175,7 +4883,7 @@ def main():
         state["__last_recap_date__"] = zurich_now().date().isoformat()
         save_state(state)
         try:
-            send_morning_recap(state)
+            send_morning_recap(state, memory=memory)
         except Exception as e:
             print(f"  Morning recap error (non-fatal): {e}")
 
@@ -4188,6 +4896,24 @@ def main():
         save_memory(memory)   # save any outcome updates from check_and_update_outcomes
         return
     else:
+        # ── Holiday check ─────────────────────────────────────────────────────
+        if POLYGON_KEY:
+            try:
+                holiday_url = f"https://api.massive.com/v1/marketstatus/now"
+                holiday_r   = requests.get(holiday_url,
+                                           params={"apiKey": POLYGON_KEY}, timeout=8)
+                if holiday_r.status_code == 200:
+                    holiday_data = holiday_r.json()
+                    exchanges    = holiday_data.get("exchanges") or {}
+                    nyse         = exchanges.get("nyse", "open")
+                    if nyse == "closed":
+                        print("Market holiday (NYSE closed) — no signals today.")
+                        save_memory(memory)
+                        return
+                    elif nyse == "early-close":
+                        print("Market closing early today — reducing signal activity.")
+            except Exception as e:
+                print(f"  Holiday check failed (non-fatal): {e}")
         active_feeds = ALL_FEEDS
 
     maybe_send_weekly_summary(state)
