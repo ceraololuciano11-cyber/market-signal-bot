@@ -57,6 +57,25 @@ if not all([TELEGRAM_TOKEN, CHAT_ID, ANTHROPIC_KEY]):
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
+# ── Session-level endpoint-failure tracker ────────────────────────────────
+# Polygon endpoints that are not in the subscription return a quick non-200
+# and cost almost no time.  But if they time out (server slow / firewall),
+# repeated 5-second waits per signal add up fast.  After two consecutive
+# failures the endpoint is skipped for the rest of this GitHub Actions job.
+_ENDPOINT_SKIP: dict = {}   # endpoint_name -> consecutive fail count
+
+def _ep_ok(name: str) -> bool:
+    """True unless this endpoint has failed ≥2 times this session."""
+    return _ENDPOINT_SKIP.get(name, 0) < 2
+
+def _ep_fail(name: str) -> None:
+    """Increment failure counter; at 2 the endpoint is skipped this session."""
+    _ENDPOINT_SKIP[name] = _ENDPOINT_SKIP.get(name, 0) + 1
+
+def _ep_reset(name: str) -> None:
+    """Clear failure counter on success so a later recovery is honoured."""
+    _ENDPOINT_SKIP.pop(name, None)
+
 # ─────────────────────────────
 # FEEDS
 # ─────────────────────────────
@@ -2522,6 +2541,8 @@ def fetch_options_flow(symbol: str, memory: dict) -> dict:
     poly_sym = POLYGON_SYMBOLS.get(symbol, "")
     if poly_sym not in ("SPY", "QQQ"):
         return {}
+    if not _ep_ok("options"):
+        return {}
 
     options_cache = memory.setdefault("options_cache", {})
     cache_key = f"{poly_sym}_options"
@@ -2540,8 +2561,9 @@ def fetch_options_flow(symbol: str, memory: dict) -> dict:
         url  = f"https://api.massive.com/v3/snapshot/options/{poly_sym}"
         resp = requests.get(url, params={"limit": 250, "order": "desc",
                                           "sort": "open_interest", "apiKey": POLYGON_KEY},
-                            timeout=12)
+                            timeout=5)
         if resp.status_code != 200:
+            _ep_fail("options")
             return {}
         results = resp.json().get("results") or []
 
@@ -2652,10 +2674,12 @@ def fetch_options_flow(symbol: str, memory: dict) -> dict:
         }
         result = dict(data)
         result["fetched_fresh"] = True
+        _ep_reset("options")
         print(f"  Options flow fetched for {poly_sym}: PCR={pcr}, IV={iv_avg}")
         return result
 
     except Exception as e:
+        _ep_fail("options")
         print(f"  Options flow error ({symbol}): {e}")
         return {}
 
@@ -2669,6 +2693,8 @@ def fetch_treasury_yields(memory: dict) -> dict:
     Returns 2Y, 10Y, 30Y yields and curve interpretation.
     """
     if not POLYGON_KEY:
+        return {}
+    if not _ep_ok("yields"):
         return {}
 
     yields_cache = memory.setdefault("yields_cache", {})
@@ -2685,11 +2711,13 @@ def fetch_treasury_yields(memory: dict) -> dict:
 
     try:
         url  = "https://api.massive.com/economy/v1/treasury-yields"
-        resp = requests.get(url, params={"apiKey": POLYGON_KEY}, timeout=12)
+        resp = requests.get(url, params={"apiKey": POLYGON_KEY}, timeout=5)
         if resp.status_code != 200:
+            _ep_fail("yields")
             return {}
         results = resp.json().get("results") or []
         if not results:
+            _ep_fail("yields")
             return {}
 
         # Most recent entry (last item)
@@ -2749,10 +2777,12 @@ def fetch_treasury_yields(memory: dict) -> dict:
         }
         result = dict(data)
         result["fetched_fresh"] = True
+        _ep_reset("yields")
         print(f"  Treasury yields fetched: 2Y={y2}, 10Y={y10}, spread={spread_2_10}")
         return result
 
     except Exception as e:
+        _ep_fail("yields")
         print(f"  Treasury yields error: {e}")
         return {}
 
@@ -2775,6 +2805,8 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
     poly_sym = POLYGON_SYMBOLS.get(symbol, "")
     if poly_sym not in ("SPY", "QQQ"):
         return {}
+    if not _ep_ok("short"):
+        return {}
 
     short_cache = memory.setdefault("short_cache", {})
     cache_key = f"{poly_sym}_short"
@@ -2792,11 +2824,13 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
     try:
         url  = f"https://api.massive.com/stocks/v1/short-interest"
         resp = requests.get(url, params={"ticker": poly_sym, "limit": 2,
-                                          "apiKey": POLYGON_KEY}, timeout=12)
+                                          "apiKey": POLYGON_KEY}, timeout=5)
         if resp.status_code != 200:
+            _ep_fail("short")
             return {}
         results = resp.json().get("results") or []
         if not results:
+            _ep_fail("short")
             return {}
 
         entry = results[0]
@@ -2829,7 +2863,7 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
                 "https://api.massive.com/stocks/v1/short-volume",
                 params={"ticker": poly_sym, "date": today_str,
                         "limit": 1, "apiKey": POLYGON_KEY},
-                timeout=10,
+                timeout=5,
             )
             if sv_resp.status_code == 200:
                 sv_results = sv_resp.json().get("results") or []
@@ -2896,11 +2930,13 @@ def fetch_short_data(symbol: str, memory: dict) -> dict:
         }
         result = dict(data)
         result["fetched_fresh"] = True
+        _ep_reset("short")
         print(f"  Short data fetched for {poly_sym}: DTC={days_to_cover}, "
               f"short_vol={short_vol_ratio}%, squeeze={squeeze_setup}")
         return result
 
     except Exception as e:
+        _ep_fail("short")
         print(f"  Short data error ({symbol}): {e}")
         return {}
 
@@ -2917,6 +2953,8 @@ def fetch_premarket_data(symbol: str, memory: dict) -> dict:
         return {}
     poly_sym = POLYGON_SYMBOLS.get(symbol, "")
     if not poly_sym:
+        return {}
+    if not _ep_ok("premarket"):
         return {}
 
     premarket_cache = memory.setdefault("premarket_cache", {})
@@ -2945,8 +2983,9 @@ def fetch_premarket_data(symbol: str, memory: dict) -> dict:
 
         url  = f"https://api.massive.com/v1/open-close/{poly_sym}/{yesterday_str}"
         resp = requests.get(url, params={"adjusted": "true", "apiKey": POLYGON_KEY},
-                            timeout=12)
+                            timeout=5)
         if resp.status_code != 200:
+            _ep_fail("premarket")
             return {}
         body = resp.json()
 
@@ -2994,10 +3033,12 @@ def fetch_premarket_data(symbol: str, memory: dict) -> dict:
         }
         result = dict(data)
         result["fetched_fresh"] = True
+        _ep_reset("premarket")
         print(f"  Pre-market data fetched for {poly_sym}: gap_bias={gap_bias}")
         return result
 
     except Exception as e:
+        _ep_fail("premarket")
         print(f"  Pre-market data error ({symbol}): {e}")
         return {}
 
@@ -3584,16 +3625,22 @@ STOP: [stop loss — single number]
 TARGET: [profit target — single number or range]
 WATCH: [the one thing that would invalidate this trade]"""
 
-    try:
-        res = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=700,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return res.content[0].text
-    except Exception as e:
-        print(f"  AI error: {e}")
-        return "BIAS: NEUTRAL\nIMPACT: 5\nAFFECTS: unknown\nREASON: AI unavailable\nENTRY: n/a\nSTOP: n/a\nTARGET: n/a\nWATCH: n/a"
+    _ai_last_err = None
+    for _ai_attempt in range(3):
+        try:
+            res = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=700,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return res.content[0].text
+        except Exception as e:
+            _ai_last_err = e
+            print(f"  AI error (attempt {_ai_attempt + 1}/3): {type(e).__name__}: {e}")
+            if _ai_attempt < 2:
+                time.sleep(4 * (_ai_attempt + 1))  # 4s then 8s before retrying
+    print(f"  All AI retries exhausted.")
+    return "BIAS: NEUTRAL\nIMPACT: 5\nAFFECTS: unknown\nREASON: AI unavailable\nENTRY: n/a\nSTOP: n/a\nTARGET: n/a\nWATCH: n/a"
 
 def parse_ai(ai_text: str) -> dict:
     """Extract AI response fields with line-anchored regex.
@@ -4871,16 +4918,20 @@ Rules:
 - Be direct — no fluff, no intro sentence, go straight to the content
 - Numbers only for price levels"""
 
-    try:
-        res = client.messages.create(
-            model      = "claude-sonnet-4-6",
-            max_tokens = 650,
-            messages   = [{"role": "user", "content": prompt}],
-        )
-        brief = res.content[0].text.strip()
-    except Exception as e:
-        print(f"  Morning recap AI error: {e}")
-        brief = "AI unavailable — check markets manually."
+    brief = "AI unavailable — check markets manually."
+    for _ai_attempt in range(3):
+        try:
+            res = client.messages.create(
+                model      = "claude-sonnet-4-6",
+                max_tokens = 650,
+                messages   = [{"role": "user", "content": prompt}],
+            )
+            brief = res.content[0].text.strip()
+            break
+        except Exception as e:
+            print(f"  Morning recap AI error (attempt {_ai_attempt + 1}/3): {type(e).__name__}: {e}")
+            if _ai_attempt < 2:
+                time.sleep(4 * (_ai_attempt + 1))
 
     # ── 6. Format & send ─────────────────────────────────────────────────────
     cal_line = ""
@@ -4998,6 +5049,31 @@ def main():
 
     # ── TECHNICAL BREAKOUT ALERTS (no news required) ─────────────────────
     maybe_send_breakout_alerts(state)
+
+    # ── PRE-FETCH SUPPLEMENTARY POLYGON DATA (once per run) ─────────────────
+    # Calling these here populates memory cache so every analyze() call in the
+    # signal loop gets instant cache hits instead of live HTTP timeouts.
+    # On failure _ep_fail() is set; after ≥2 fails the endpoint is skipped
+    # for the rest of this job — no repeated 5-second timeouts per signal.
+    if POLYGON_KEY and not weekend:
+        print("Pre-fetching supplementary Polygon data (once per run)...")
+        try:
+            # Treasury yields — no symbol restriction
+            fetch_treasury_yields(memory)
+            # Pre-market gap data — all symbols
+            for _pm_sym in list(POLYGON_SYMBOLS.keys()):
+                fetch_premarket_data(_pm_sym, memory)
+                time.sleep(0.3)
+            # Options flow + short data — SPY / QQQ only
+            for _eq_sym in ["^GSPC", "QQQ"]:
+                if _eq_sym in POLYGON_SYMBOLS:
+                    fetch_options_flow(_eq_sym, memory)
+                    time.sleep(0.5)
+                    fetch_short_data(_eq_sym, memory)
+                    time.sleep(0.5)
+        except Exception as _pf_err:
+            print(f"  Pre-fetch error (non-fatal): {_pf_err}")
+        print("  Supplementary pre-fetch done.")
 
     # ── PRE-SCAN: count how many outlets report each story ──────────────
     print("Pre-scanning feeds for multi-source stories...")
