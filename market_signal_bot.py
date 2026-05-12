@@ -48,6 +48,8 @@ MAX_HEADLINE_AGE_MIN = 45
 SYMBOL_COOLDOWN_MIN  = 15
 SIMILARITY_THRESHOLD = 0.78
 SEEN_FILE            = "seen_headlines.json"
+MEMORY_FILE          = "signal_memory.json"
+OUTCOME_EXPIRY_DAYS  = 3   # signals are marked EXPIRED if neither TP nor SL hit within 3 days
 MAX_SIGNALS_PER_RUN  = 5   # Cap signals per 5-min run — prevents Telegram spam during news floods
 
 if not all([TELEGRAM_TOKEN, CHAT_ID, ANTHROPIC_KEY]):
@@ -2051,6 +2053,407 @@ def save_state(state: dict):
     except Exception as e:
         print(f"  Could not save state: {e}")
 
+# ═════════════════════════════════════════════════════════════════════════════
+# SIGNAL MEMORY — Phase 1: outcome tracking + lessons
+# ═════════════════════════════════════════════════════════════════════════════
+# Every BUY/SELL signal is saved to signal_memory.json with its entry, stop,
+# and target. On each subsequent run the bot checks whether open signals have
+# hit TP or SL (or expired after OUTCOME_EXPIRY_DAYS). Resolved signals feed
+# a lessons-learned digest that is injected into the AI prompt so Claude can
+# see the bot's own historical accuracy and which indicators predicted wins.
+# ─────────────────────────────
+
+def load_memory() -> dict:
+    """Load signal_memory.json — returns a clean skeleton on first run."""
+    try:
+        with open(MEMORY_FILE) as f:
+            data = json.load(f)
+        data.setdefault("signals",         [])
+        data.setdefault("poly_hist_cache", {})
+        return data
+    except Exception:
+        return {"signals": [], "poly_hist_cache": {}}
+
+
+def save_memory(memory: dict):
+    """Persist memory — keep only the most recent 300 signals."""
+    try:
+        memory["signals"] = memory["signals"][-300:]
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(memory, f)
+    except Exception as e:
+        print(f"  Could not save memory: {e}")
+
+
+def record_signal(memory: dict, symbol: str, bias: str, price: float,
+                  stop_str: str, target_str: str,
+                  conf_score: int, conf_total: int,
+                  poly_flow: dict, headline: str, base_score: int):
+    """Save a sent BUY/SELL signal so its outcome can be tracked later."""
+    if bias not in ("BUY", "SELL"):
+        return
+
+    # Parse stop to float
+    stop_f = None
+    try:
+        stop_f = float(stop_str)
+    except Exception:
+        pass
+
+    # Parse target — may be a range like "3050.0-3080.0"
+    target_lo = target_hi = None
+    try:
+        tparts = str(target_str).split("-")
+        if len(tparts) == 2:
+            t1, t2 = float(tparts[0]), float(tparts[1])
+            target_lo, target_hi = min(t1, t2), max(t1, t2)
+        else:
+            target_lo = target_hi = float(tparts[0])
+    except Exception:
+        pass
+
+    # Record which Polygon events were present at signal time
+    poly_events = [
+        k for k in ("block_trade", "delta_flip", "exhaustion",
+                    "absorption", "imbalance", "bar_streak")
+        if poly_flow.get(k)
+    ]
+
+    memory["signals"].append({
+        "ts":          now_utc().isoformat(),
+        "symbol":      symbol,
+        "bias":        bias,
+        "price":       price,
+        "stop":        stop_f,
+        "target_lo":   target_lo,
+        "target_hi":   target_hi,
+        "conf_score":  conf_score,
+        "conf_total":  conf_total,
+        "score":       base_score,
+        "poly_bias":   poly_flow.get("of_bias", ""),
+        "buy_pct":     poly_flow.get("buy_pct"),
+        "poly_events": poly_events,
+        "headline":    headline[:100],
+        "outcome":     None,   # filled in by check_and_update_outcomes()
+        "outcome_ts":  None,
+    })
+
+
+def check_and_update_outcomes(memory: dict):
+    """
+    For every open signal (outcome=None) compare current cached price against
+    the recorded stop and target.  Marks outcome as:
+      TP_HIT   — price reached target (BUY: price >= target_lo | SELL: price <= target_hi)
+      SL_HIT   — price hit the stop   (BUY: price <= stop      | SELL: price >= stop)
+      EXPIRED  — signal older than OUTCOME_EXPIRY_DAYS with no hit
+    Already-resolved signals are left untouched.
+    """
+    open_sigs = [s for s in memory["signals"] if s.get("outcome") is None]
+    if not open_sigs:
+        return
+
+    expiry_cutoff = now_utc() - timedelta(days=OUTCOME_EXPIRY_DAYS)
+
+    for sig in open_sigs:
+        # Expire stale signals first
+        try:
+            if datetime.fromisoformat(sig["ts"]) < expiry_cutoff:
+                sig["outcome"]    = "EXPIRED"
+                sig["outcome_ts"] = now_utc().isoformat()
+                continue
+        except Exception:
+            pass
+
+        symbol  = sig.get("symbol", "")
+        bias    = sig.get("bias",   "")
+        stop_f  = sig.get("stop")
+        t_lo    = sig.get("target_lo")
+        t_hi    = sig.get("target_hi")
+
+        # Get current price from live cache
+        current = (_price_cache.get(symbol) or {}).get("price")
+        if not current:
+            continue
+
+        now_ts = now_utc().isoformat()
+        if bias == "BUY":
+            if stop_f is not None and current <= stop_f:
+                sig["outcome"] = "SL_HIT"; sig["outcome_ts"] = now_ts
+            elif t_lo is not None and current >= t_lo:
+                sig["outcome"] = "TP_HIT"; sig["outcome_ts"] = now_ts
+        elif bias == "SELL":
+            if stop_f is not None and current >= stop_f:
+                sig["outcome"] = "SL_HIT"; sig["outcome_ts"] = now_ts
+            elif t_hi is not None and current <= t_hi:
+                sig["outcome"] = "TP_HIT"; sig["outcome_ts"] = now_ts
+
+
+def build_lessons_digest(memory: dict, symbol: str) -> str:
+    """
+    Build a compact performance digest for the AI prompt.
+    Shows win-rate, which Polygon indicators correlated with wins vs losses,
+    and recent form — all based on *resolved* signals only.
+    Returns "" if fewer than 4 resolved signals exist for this symbol.
+    """
+    settled = [
+        s for s in memory.get("signals", [])[-200:]
+        if s.get("symbol") == symbol
+        and s.get("outcome") in ("TP_HIT", "SL_HIT")
+    ]
+    if len(settled) < 4:
+        return ""
+
+    wins   = [s for s in settled if s["outcome"] == "TP_HIT"]
+    losses = [s for s in settled if s["outcome"] == "SL_HIT"]
+    total  = len(settled)
+    win_rate = len(wins) / total * 100
+
+    def avg_conf(sigs):
+        ratios = [s["conf_score"] / s["conf_total"]
+                  for s in sigs
+                  if (s.get("conf_total") or 0) > 0]
+        return sum(ratios) / len(ratios) * 100 if ratios else None
+
+    w_conf = avg_conf(wins)
+    l_conf = avg_conf(losses)
+
+    lines = [
+        f"📚 SIGNAL MEMORY — {symbol} ({total} resolved signals):",
+        f"  Win rate: {win_rate:.0f}%  ({len(wins)} wins / {len(losses)} losses)",
+    ]
+    if w_conf is not None and l_conf is not None:
+        lines.append(f"  Avg confidence → wins: {w_conf:.0f}%  |  losses: {l_conf:.0f}%")
+
+    # ── Which Polygon events predicted wins vs losses ─────────────────────────
+    insights = []
+    for ev in ("block_trade", "delta_flip", "imbalance", "absorption", "exhaustion"):
+        with_ev    = [s for s in settled if ev in (s.get("poly_events") or [])]
+        without_ev = [s for s in settled if ev not in (s.get("poly_events") or [])]
+        if len(with_ev) < 3:
+            continue
+        w_with    = sum(1 for s in with_ev    if s["outcome"] == "TP_HIT")
+        w_without = sum(1 for s in without_ev if s["outcome"] == "TP_HIT") if without_ev else 0
+        wr_with   = w_with / len(with_ev)    * 100
+        wr_without = w_without / len(without_ev) * 100 if without_ev else 0
+        diff = wr_with - wr_without
+        if abs(diff) >= 15:
+            tag = "↑ better when present" if diff > 0 else "↓ worse when present"
+            insights.append(
+                f"{ev.replace('_', ' ')}: {wr_with:.0f}% win w/ it vs "
+                f"{wr_without:.0f}% without ({tag})"
+            )
+
+    # ── buy% effectiveness ────────────────────────────────────────────────────
+    for direction, threshold, bp_label in [("BUY", 65, "buy%≥65"), ("SELL", 35, "buy%≤35")]:
+        dir_sigs = [s for s in settled if s.get("bias") == direction]
+        if len(dir_sigs) < 4:
+            continue
+        if direction == "BUY":
+            strong = [s for s in dir_sigs if (s.get("buy_pct") or 50) >= threshold]
+            weak   = [s for s in dir_sigs if (s.get("buy_pct") or 50) <  threshold]
+        else:
+            strong = [s for s in dir_sigs if (s.get("buy_pct") or 50) <= threshold]
+            weak   = [s for s in dir_sigs if (s.get("buy_pct") or 50) >  threshold]
+        if len(strong) >= 2 and len(weak) >= 2:
+            ws = sum(1 for s in strong if s["outcome"] == "TP_HIT")
+            ww = sum(1 for s in weak   if s["outcome"] == "TP_HIT")
+            rs = ws / len(strong) * 100
+            rw = ww / len(weak)   * 100
+            if abs(rs - rw) >= 15:
+                insights.append(
+                    f"{direction} signals — {bp_label}: {rs:.0f}% win "
+                    f"vs {rw:.0f}% when not ({'+' if rs > rw else ''}{rs - rw:.0f}pp)"
+                )
+
+    if insights:
+        lines.append("  Pattern analysis:")
+        for ins in insights[:4]:
+            lines.append(f"    • {ins}")
+
+    # ── Recent form ───────────────────────────────────────────────────────────
+    recent_5 = settled[-5:]
+    r_wins   = sum(1 for s in recent_5 if s["outcome"] == "TP_HIT")
+    lines.append(f"  Recent form: {r_wins}/{len(recent_5)} won (last {len(recent_5)} signals)")
+
+    return "\n".join(lines)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# POLYGON HISTORICAL DATA — Phase 2: 2-year daily bar context
+# ═════════════════════════════════════════════════════════════════════════════
+# Fetches up to 2 years of daily bars for each primary symbol using the same
+# Massive/Polygon API.  Cached in memory['poly_hist_cache'] for 6 hours so
+# the 5-req/min rate limit is not stressed on routine 10-minute runs.
+#
+# Provides:
+#   52-week high/low     → macro range context for the AI + extra SL/TP levels
+#   200-day EMA          → long-term trend direction
+#   Historical volatility (20-day ATR %) → context for stop sizing
+#   Historical S/R levels (swing cluster) → additional confluence levels
+#   at_hist_level        → flags when price is right at a historical key level
+# ─────────────────────────────
+
+def fetch_polygon_historical(symbol: str, memory: dict) -> dict:
+    """
+    Fetch 2 years of daily bars for macro/historical context.
+    Cached in memory['poly_hist_cache'] for 6 hours.
+    Returns {} on any failure or if POLYGON_KEY is not set.
+    Caller must add time.sleep(13) ONLY when this returns fresh data
+    (use the 'fetched_fresh' key in the return dict to decide).
+    """
+    if not POLYGON_KEY:
+        return {}
+    poly_sym = POLYGON_SYMBOLS.get(symbol)
+    if not poly_sym:
+        return {}
+
+    cache_key       = f"{poly_sym}_hist"
+    poly_hist_cache = memory.setdefault("poly_hist_cache", {})
+    cached          = poly_hist_cache.get(cache_key, {})
+
+    # Return cached data if it is less than 6 hours old
+    if cached:
+        try:
+            cached_ts = datetime.fromisoformat(cached["fetched_at"])
+            if (now_utc() - cached_ts) < timedelta(hours=6):
+                data = cached.get("data", {})
+                data["fetched_fresh"] = False
+                return data
+        except Exception:
+            pass
+
+    # ── Fetch from Polygon (daily bars, up to 2 years) ───────────────────────
+    try:
+        from datetime import date as _date
+        to_date   = _date.today().isoformat()
+        from_date = (_date.today() - timedelta(days=730)).isoformat()
+        url = (
+            f"https://api.massive.com/v2/aggs/ticker/{poly_sym}"
+            f"/range/1/day/{from_date}/{to_date}"
+        )
+        params = {
+            "adjusted": "true",
+            "sort":     "asc",
+            "limit":    750,    # 2 years ≈ 504 trading days; 750 gives headroom
+            "apiKey":   POLYGON_KEY,
+        }
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            print(f"  Polygon hist: HTTP {r.status_code} for {poly_sym}")
+            return {}
+        resp = r.json()
+        if resp.get("status") not in ("OK", "DELAYED"):
+            return {}
+        bars = resp.get("results", [])
+        if len(bars) < 50:
+            return {}
+
+        closes = [b.get("c") or 0 for b in bars]
+        highs  = [b.get("h") or 0 for b in bars]
+        lows   = [b.get("l") or 0 for b in bars]
+        current = closes[-1]
+        if current <= 0:
+            return {}
+
+        # ── 52-week high / low ────────────────────────────────────────────────
+        w52      = bars[-252:] if len(bars) >= 252 else bars
+        high_52w = max((b.get("h") or 0) for b in w52)
+        low_52w  = min((b.get("l") or float("inf")) for b in w52)
+        if low_52w == float("inf"):
+            low_52w = None
+
+        pct_from_52h = round((current - high_52w) / high_52w * 100, 2) if high_52w else 0
+        pct_from_52l = round((current - low_52w)  / low_52w  * 100, 2) if low_52w  else 0
+
+        # ── 200-day EMA ───────────────────────────────────────────────────────
+        ema_200 = None
+        ema_200_trend = ""
+        if len(closes) >= 200:
+            ema_200 = calculate_ema(closes, 200)
+        elif len(closes) >= 50:
+            ema_200 = calculate_ema(closes, max(50, len(closes) // 2))
+        if ema_200 and current:
+            if current > ema_200:
+                ema_200_trend = f"above 200d EMA ({ema_200}) — long-term uptrend"
+            else:
+                ema_200_trend = f"below 200d EMA ({ema_200}) — long-term downtrend"
+
+        # ── 20-day ATR as % of price (normalized historical volatility) ───────
+        hist_vol_pct = None
+        if len(highs) >= 22 and len(lows) >= 22 and len(closes) >= 22:
+            atr_20 = calculate_atr(highs[-22:], lows[-22:], closes[-22:], period=20)
+            if atr_20 and current:
+                hist_vol_pct = round(atr_20 / current * 100, 2)
+
+        # ── Swing-based historical key S/R levels ─────────────────────────────
+        sig_levels = []
+        for i in range(2, len(closes) - 2):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2]
+                    and highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                sig_levels.append(("R", round(highs[i], 4)))
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2]
+                    and lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                sig_levels.append(("S", round(lows[i], 4)))
+
+        # Cluster nearby levels (within 0.5% of each other → same zone)
+        clustered: list = []
+        for lvl_type, lvl_price in sig_levels[-200:]:
+            if lvl_price <= 0:
+                continue
+            merged = False
+            for cg in clustered:
+                if abs(cg["price"] - lvl_price) / lvl_price < 0.005:
+                    n = cg["count"]
+                    cg["price"] = round((cg["price"] * n + lvl_price) / (n + 1), 4)
+                    cg["count"] += 1
+                    merged = True
+                    break
+            if not merged:
+                clustered.append({"price": lvl_price, "type": lvl_type, "count": 1})
+
+        # Top 6 most-tested zones
+        key_levels = sorted(clustered, key=lambda x: x["count"], reverse=True)[:6]
+
+        # ── Is price near a historical key level? ─────────────────────────────
+        at_hist_level = None
+        for kl in key_levels:
+            if kl["price"] > 0:
+                dist_pct = abs(current - kl["price"]) / current * 100
+                if dist_pct <= 0.5:
+                    lbl = "resistance" if kl["type"] == "R" else "support"
+                    at_hist_level = (
+                        f"Price at historical {lbl} zone {kl['price']} "
+                        f"({kl['count']} historical touches) — high-confluence level"
+                    )
+                    break
+
+        hist_data = {
+            "high_52w":      round(high_52w, 4) if high_52w else None,
+            "low_52w":       round(low_52w,  4) if low_52w  else None,
+            "pct_from_52h":  pct_from_52h,
+            "pct_from_52l":  pct_from_52l,
+            "ema_200":       ema_200,
+            "ema_200_trend": ema_200_trend,
+            "hist_vol_pct":  hist_vol_pct,
+            "key_levels":    key_levels,
+            "at_hist_level": at_hist_level,
+            "bar_count":     len(bars),
+            "fetched_fresh": True,
+        }
+
+        # Store in cache
+        poly_hist_cache[cache_key] = {
+            "fetched_at": now_utc().isoformat(),
+            "data":       {k: v for k, v in hist_data.items() if k != "fetched_fresh"},
+        }
+        print(f"  Polygon hist: {len(bars)} daily bars for {poly_sym} ({symbol})")
+        return hist_data
+
+    except Exception as e:
+        print(f"  Polygon hist error ({symbol}): {e}")
+        return {}
+
+
 # ─────────────────────────────
 # SIGNAL COOLDOWN
 # ─────────────────────────────
@@ -2234,7 +2637,15 @@ def _build_tech_block(d: dict, label: str) -> str:
     return "\n".join(lines)
 
 def analyze(title: str, reaction: str, moves: dict, signal_type: str,
-            calendar_events: list, primary_symbol: str = "") -> str:
+            calendar_events: list, primary_symbol: str = "",
+            memory: dict = None) -> str:
+    """
+    Full AI analysis of a signal.  Now accepts optional `memory` dict to:
+      1. Fetch + cache 2-year historical data for the primary symbol
+      2. Inject a lessons-learned digest from past signal outcomes
+    Both additions are injected into the Claude prompt for improved reasoning.
+    """
+    memory = memory or {}
 
     # ── Build rich technical context for primary instrument ──────────────────
     primary_data = moves.get(primary_symbol, {})
@@ -2365,6 +2776,50 @@ def analyze(title: str, reaction: str, moves: dict, signal_type: str,
                 parts.append(f"{ev_key.replace('_',' ').title()}: {ev}")
         polygon_context = "\n\n━━━ REAL ORDER FLOW (Polygon — live exchange data) ━━━\n" + "\n".join(parts)
 
+    # ── Historical context (2-year daily bars, Polygon) ───────────────────────
+    hist_block = ""
+    if POLYGON_KEY and primary_symbol in POLYGON_SYMBOLS:
+        hist_data = fetch_polygon_historical(primary_symbol, memory)
+        # Store on primary_data so compute_trade_levels() can use it too
+        if hist_data and primary_data:
+            primary_data["poly_hist"] = hist_data
+            # Also store on the live cache so format_msg sees it
+            if primary_symbol in _price_cache:
+                _price_cache[primary_symbol]["poly_hist"] = hist_data
+        # Rate-limit: only sleep when a fresh API call was actually made
+        if hist_data.get("fetched_fresh"):
+            time.sleep(13)
+
+        if hist_data:
+            h_lines = ["━━━ HISTORICAL CONTEXT (2 years of daily bars) ━━━"]
+            if hist_data.get("high_52w") and hist_data.get("low_52w"):
+                h_lines.append(
+                    f"52-week range: {hist_data['low_52w']} – {hist_data['high_52w']} | "
+                    f"Price vs 52w high: {hist_data['pct_from_52h']:+.1f}% | "
+                    f"vs 52w low: +{hist_data['pct_from_52l']:.1f}%"
+                )
+            if hist_data.get("ema_200_trend"):
+                h_lines.append(f"Long-term trend: {hist_data['ema_200_trend']}")
+            if hist_data.get("hist_vol_pct"):
+                h_lines.append(
+                    f"Historical daily volatility (ATR%): {hist_data['hist_vol_pct']:.2f}% "
+                    f"— use this to calibrate stop sizing"
+                )
+            if hist_data.get("at_hist_level"):
+                h_lines.append(f"⚠️ KEY LEVEL: {hist_data['at_hist_level']}")
+            key_lvls = hist_data.get("key_levels") or []
+            if key_lvls:
+                kl_str = " | ".join(
+                    f"{kl['type']} {kl['price']} ({kl['count']} touches)"
+                    for kl in key_lvls[:4]
+                )
+                h_lines.append(f"Historical S/R zones: {kl_str}")
+            hist_block = "\n" + "\n".join(h_lines)
+
+    # ── Memory lessons digest ─────────────────────────────────────────────────
+    lessons_str  = build_lessons_digest(memory, primary_symbol) if memory else ""
+    memory_block = f"\n\n━━━ BOT LEARNING (past signal outcomes) ━━━\n{lessons_str}" if lessons_str else ""
+
     prim_name = friendly(primary_symbol) if primary_symbol else "the most affected asset"
     prim_price = primary_data.get("price", "n/a")
     prim_move  = f"{primary_data['move']:+.2f}%" if primary_data.get("move") is not None else "n/a"
@@ -2386,12 +2841,14 @@ Dollar Index: {dxy_str}
 High-impact events today: {cal_str}
 {macro_note}
 {polygon_context}
+{hist_block}
+{memory_block}
 
 ━━━ OTHER INSTRUMENTS (context) ━━━
 {other_str}
 
 ━━━ YOUR TASK ━━━
-Analyze this headline for {prim_name}. Synthesize ALL data above — especially the real Polygon order flow — into one unified view:
+Analyze this headline for {prim_name}. Synthesize ALL data above — especially the real Polygon order flow and historical context — into one unified view:
 
 1. FUNDAMENTAL: What does this news mean for this asset? Is the move justified or overreacted?
 2. TECHNICAL: Do RSI, trend (all timeframes), VWAP, market structure CONFIRM or CONTRADICT the bias?
@@ -2403,8 +2860,10 @@ Analyze this headline for {prim_name}. Synthesize ALL data above — especially 
    - Block trades = institutional footprint (smart money direction)
    - Opening range breakout = structural confirmation for equities
    Conflicting order flow MUST lower IMPACT. Aligned order flow MUST raise IMPACT.
-4. LOCATION: Is price at a favourable entry (discount for BUY, premium for SELL)? VPOC, VAH/VAL, S/R levels?
-5. RISK: The single biggest reason this trade fails.
+4. LOCATION: Is price at a favourable entry (discount for BUY, premium for SELL)? VPOC, VAH/VAL, S/R levels? Historical key zones?
+5. HISTORICAL: Does the 52-week context support this trade? Is price near a major historical level?
+6. PAST PERFORMANCE: If signal memory is provided, use the win-rate patterns to calibrate your IMPACT rating. High-confidence signals with historically predictive indicators should be rated higher.
+7. RISK: The single biggest reason this trade fails.
 
 IMPACT RATING GUIDE (be strict):
   1-3 = minor news, order flow neutral or contradicting, technicals mixed
@@ -2576,13 +3035,15 @@ def is_at_trap_level(bias: str, primary_data: dict, threshold_pct: float = 0.4) 
 # ─────────────────────────────
 # TRADE LEVELS (programmatic — anchored to support/resistance)
 # ─────────────────────────────
-def compute_trade_levels(bias: str, primary_data: dict) -> dict:
-    """Compute Entry/SL/TP using full Polygon + yfinance confluence.
+def compute_trade_levels(bias: str, primary_data: dict,
+                         hist_data: dict = None) -> dict:
+    """Compute Entry/SL/TP using full Polygon + yfinance + historical confluence.
 
     Level sources (all used simultaneously):
       Polygon real data  : VPOC, VAH, VAL, VWAP, swing S/R, session H/L, OR H/L
       yfinance 15m       : support, resistance
       yfinance daily     : daily_support, daily_resistance
+      Historical (2yr)   : 52-week high/low, historical key S/R cluster levels
       volatility         : ATR for buffer sizing
 
     BUY logic:
@@ -2590,15 +3051,15 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
       SL     : highest support meaningfully below price — prioritises real
                Polygon levels (VAL, swing support, VWAP breakdown) over yfinance;
                closest valid level = tightest stop = best R/R
-      TP1    : nearest upside confluence ≥1R away, priority order:
+      TP1    : nearest upside confluence ≥1.5R away, priority order:
                VPOC (price magnet) → VWAP (mean-reversion target) → VAH
                → OR high → 15m resistance → Polygon swing resistance
-               → daily resistance → session high
+               → daily resistance → historical S/R → 52-week high → session high
       TP2    : next confluence level above TP1, or 2.5R extension
 
     SELL logic: mirror of BUY.
 
-    Always enforces SL on loss side, TP on profit side, R:R ≥ 1:1.
+    Always enforces SL on loss side, TP on profit side, R:R ≥ 1.5:1.
     Returns {} if bias is non-directional or price is missing.
     """
     price = primary_data.get("price")
@@ -2624,6 +3085,16 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
     s_lo  = poly.get("session_low")    # session floor
     or_hi = poly.get("or_high")        # opening range high (15-min)
     or_lo = poly.get("or_low")         # opening range low  (15-min)
+
+    # ── Historical levels (2-year daily bars) ────────────────────────────────
+    hist  = hist_data or (primary_data.get("poly_hist") or {})
+    h52_hi = hist.get("high_52w")      # 52-week high — major resistance zone
+    h52_lo = hist.get("low_52w")       # 52-week low  — major support zone
+    # Historical key levels: sorted cluster of swing S/R over 2 years
+    hist_key_levels = hist.get("key_levels") or []
+    # Extract the top historical R and S levels separately
+    h_key_res = next((kl["price"] for kl in hist_key_levels if kl["type"] == "R"), None)
+    h_key_sup = next((kl["price"] for kl in hist_key_levels if kl["type"] == "S"), None)
 
     # ── ATR-aware buffer ─────────────────────────────────────────────────────
     # At least 0.15% of price, scales with volatility so stops breathe in
@@ -2653,8 +3124,9 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
 
         # ── SL: best support below price (take HIGHEST = tightest valid stop)
         # Priority: VAL > Polygon swing > VWAP breakdown > 15m S/R > daily S/R
+        #           > historical key support > 52-week low
         sl_pool = [
-            lvl for lvl in [val, p_sup, vwap, or_lo, s15, sd]
+            lvl for lvl in [val, p_sup, vwap, or_lo, s15, sd, h_key_sup, h52_lo]
             if _below(lvl)
         ]
         sl = (max(sl_pool) - buf) if sl_pool else (price * 0.99)
@@ -2671,14 +3143,15 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
         # Tier 1 — Polygon magnets (VPOC, VWAP, VAH/VAL): highest probability
         #   targets because they represent where real volume/interest sits.
         #   Picked first regardless of distance vs structural levels.
-        # Tier 2 — Structural S/R (OR high, swing, daily, session): picked as
-        #   TP1 fallback and TP2 extension.
+        # Tier 2 — Structural S/R (OR high, swing, daily, session, historical):
+        #   TP1 fallback and TP2 extension. Historical 52w high and key resistance
+        #   add long-term confluence for extended moves.
         magnet_tp = sorted([
             lvl - buf for lvl in [vpoc, vwap, vah]
             if lvl is not None and (lvl - buf) >= min_tp and (lvl - buf) <= max_tp
         ])
         struct_tp = sorted([
-            lvl - buf for lvl in [or_hi, r15, p_res, rd, s_hi]
+            lvl - buf for lvl in [or_hi, r15, p_res, rd, h_key_res, h52_hi, s_hi]
             if lvl is not None and (lvl - buf) >= min_tp and (lvl - buf) <= max_tp
         ])
         all_tp = magnet_tp + [t for t in struct_tp if t not in magnet_tp]
@@ -2703,8 +3176,9 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
 
     # ── SL: best resistance above price (take LOWEST = tightest valid stop)
     # Priority: VAH > Polygon swing > VWAP reclaim > 15m S/R > daily S/R
+    #           > historical key resistance > 52-week high
     sl_pool = [
-        lvl for lvl in [vah, p_res, vwap, or_hi, r15, rd]
+        lvl for lvl in [vah, p_res, vwap, or_hi, r15, rd, h_key_res, h52_hi]
         if _above(lvl)
     ]
     sl = (min(sl_pool) + buf) if sl_pool else (price * 1.01)
@@ -2723,7 +3197,7 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
         if lvl is not None and (lvl + buf) <= min_tp and (lvl + buf) >= max_tp
     ], reverse=True)   # highest = nearest to price for SELL
     struct_tp = sorted([
-        lvl + buf for lvl in [or_lo, s15, p_sup, sd, s_lo]
+        lvl + buf for lvl in [or_lo, s15, p_sup, sd, h_key_sup, h52_lo, s_lo]
         if lvl is not None and (lvl + buf) <= min_tp and (lvl + buf) >= max_tp
     ], reverse=True)
     all_tp = magnet_tp + [t for t in struct_tp if t not in magnet_tp]
@@ -2744,7 +3218,7 @@ def compute_trade_levels(bias: str, primary_data: dict) -> dict:
 # ─────────────────────────────
 def format_msg(title, reaction, base_score, moves, primary_symbol,
                ai_text, signal_type, calendar_events,
-               state, src_count=1) -> str:
+               state, src_count=1, memory=None) -> str:
 
     ai     = parse_ai(ai_text)
     bias   = sanitize(ai["BIAS"]).strip().upper()
@@ -2777,7 +3251,9 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
     # (e.g. missing price data on a directional signal).
     primary_data = dict(moves.get(primary_symbol, {}))  # copy so we can annotate safely
 
-    computed_levels = compute_trade_levels(bias, primary_data)
+    # Pull historical data from cache (set by analyze()) — pass to trade levels
+    hist_data      = primary_data.get("poly_hist") or {}
+    computed_levels = compute_trade_levels(bias, primary_data, hist_data=hist_data)
     if computed_levels:
         entry  = computed_levels["entry"]
         stop   = computed_levels["stop"]
@@ -3022,6 +3498,37 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
             daily_lines.append(f"  ⚡ {ms_d['event']}")
     daily_section = "🗓 *Daily chart:*\n" + "\n".join(daily_lines) + "\n\n" if daily_lines else ""
 
+    # ── Historical context section ─────────────────────────────────────────────
+    hist_section = ""
+    if hist_data and bias in ("BUY", "SELL"):
+        h_lines = []
+        h52_hi = hist_data.get("high_52w")
+        h52_lo = hist_data.get("low_52w")
+        if h52_hi and h52_lo:
+            h_lines.append(
+                f"  52w range:  {h52_lo} – {h52_hi} | "
+                f"vs high: {hist_data.get('pct_from_52h', 0):+.1f}% | "
+                f"vs low: +{hist_data.get('pct_from_52l', 0):.1f}%"
+            )
+        if hist_data.get("ema_200_trend"):
+            h_lines.append(f"  Long-term:  {hist_data['ema_200_trend']}")
+        if hist_data.get("hist_vol_pct"):
+            h_lines.append(f"  Daily vol:  {hist_data['hist_vol_pct']:.2f}% ATR/price")
+        if hist_data.get("at_hist_level"):
+            h_lines.append(f"  ⚡ {hist_data['at_hist_level']}")
+        if h_lines:
+            hist_section = "📅 *Historical context (2yr):*\n" + "\n".join(h_lines) + "\n\n"
+
+    # ── Memory / past performance section ─────────────────────────────────────
+    memory_section = ""
+    if memory and bias in ("BUY", "SELL"):
+        digest = build_lessons_digest(memory, primary_symbol)
+        if digest:
+            # Condense for Telegram: strip the header line, show win rate + top insight
+            dlines  = digest.split("\n")
+            compact = [ln for ln in dlines if ln.strip()][:4]  # max 4 lines in message
+            memory_section = "🧠 *Signal memory:*\n" + "\n".join(compact) + "\n\n"
+
     # Signal confidence
     conf_score, conf_total = signal_confidence(primary_data, bias)
     conf_bar     = confidence_bar(conf_score, conf_total)
@@ -3174,6 +3681,8 @@ def format_msg(title, reaction, base_score, moves, primary_symbol,
         f"{hourly_section}"
         f"{fourh_section}"
         f"{daily_section}"
+        f"{hist_section}"
+        f"{memory_section}"
         f"🎯 *Assets affected:*\n{sanitize(ai['AFFECTS'])}\n\n"
         f"👀 *Watch for:*\n{sanitize(ai['WATCH'])}\n\n"
         f"💹 *Live moves:*\n{moves_lines}\n\n"
@@ -3641,13 +4150,18 @@ def main():
         print(f"Quiet hours ({zh.strftime('%H:%M')} Zürich) — no signals until 06:30. Sleeping.")
         return
 
-    state = load_state()
+    state  = load_state()
+    memory = load_memory()
 
     weekend = is_weekend()
 
     # Fetch prices first — needed for both morning recap and signals.
     print("Fetching intraday prices + daily context...")
     refresh_price_cache()
+
+    # Check outcomes of previously sent signals against current prices.
+    # Must run AFTER refresh_price_cache() so _price_cache has current prices.
+    check_and_update_outcomes(memory)
 
     # ── MORNING RECAP (fires once at 06:30 Zürich) ───────────────────────────
     # Must run BEFORE the market-open gate — US markets are closed at 06:30
@@ -3671,6 +4185,7 @@ def main():
         active_feeds = WEEKEND_FEEDS
     elif not is_market_open():
         print("Market closed — nothing to do.")
+        save_memory(memory)   # save any outcome updates from check_and_update_outcomes
         return
     else:
         active_feeds = ALL_FEEDS
@@ -3763,7 +4278,7 @@ def main():
                 print(f"  Cooldown active for {primary_symbol}, skipping.")
                 continue
 
-            ai_text    = analyze(title, reaction, moves, signal_type, calendar_events, primary_symbol)
+            ai_text    = analyze(title, reaction, moves, signal_type, calendar_events, primary_symbol, memory=memory)
             ai_parsed  = parse_ai(ai_text)
             ai_impact  = parse_impact(ai_parsed.get("IMPACT", "5"))
             if ai_impact <= 2:
@@ -3796,17 +4311,34 @@ def main():
             msg     = format_msg(
                 title, reaction, sc, moves,
                 primary_symbol, ai_text, signal_type, calendar_events,
-                state, src_count,
+                state, src_count, memory=memory,
             )
 
             if send_telegram(msg):
                 signals_sent += 1
                 cooldowns[primary_symbol] = now_utc().isoformat()
-                if signals_sent >= MAX_SIGNALS_PER_RUN:
-                    print(f"  Signal cap ({MAX_SIGNALS_PER_RUN}) reached — stopping this run.")
-                    break
 
                 bias_clean = sanitize(ai_parsed.get("BIAS", "NEUTRAL")).strip()
+
+                # ── Record signal in memory for outcome tracking ──────────────
+                if bias_clean in ("BUY", "SELL"):
+                    p_data    = moves.get(primary_symbol, {})
+                    levels    = compute_trade_levels(bias_clean, p_data,
+                                                     hist_data=p_data.get("poly_hist"))
+                    cs, ct    = signal_confidence(p_data, bias_clean)
+                    record_signal(
+                        memory      = memory,
+                        symbol      = primary_symbol,
+                        bias        = bias_clean,
+                        price       = p_data.get("price", 0),
+                        stop_str    = levels.get("stop",   ""),
+                        target_str  = levels.get("target", ""),
+                        conf_score  = cs,
+                        conf_total  = ct,
+                        poly_flow   = p_data.get("polygon_flow") or {},
+                        headline    = title,
+                        base_score  = sc,
+                    )
 
                 update_streak(state, primary_symbol, bias_clean)
 
@@ -3818,6 +4350,10 @@ def main():
                     "symbol":   friendly(primary_symbol),
                 })
 
+                if signals_sent >= MAX_SIGNALS_PER_RUN:
+                    print(f"  Signal cap ({MAX_SIGNALS_PER_RUN}) reached — stopping this run.")
+                    break
+
             time.sleep(2)
 
         except Exception as e:
@@ -3827,6 +4363,7 @@ def main():
     state["__cooldowns__"]      = cooldowns
     state["__weekly_signals__"] = weekly_signals
     save_state(state)
+    save_memory(memory)
 
     print(f"Done. Signals sent: {signals_sent}")
 

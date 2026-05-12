@@ -17,12 +17,14 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      # Restore seen_headlines.json from the previous run so the bot
-      # remembers which headlines / signals / recap date it already sent.
+      # Restore seen_headlines.json and signal_memory.json from the previous
+      # run so the bot remembers sent headlines AND past signal outcomes.
       - name: Restore state cache
         uses: actions/cache@v4
         with:
-          path: seen_headlines.json
+          path: |
+            seen_headlines.json
+            signal_memory.json
           key: seen-${{ github.run_number }}
           restore-keys: seen-
 
@@ -43,11 +45,13 @@ jobs:
           POLYGON_KEY: ${{ secrets.POLYGON_KEY }}
         run: python market_signal_bot.py
 
-      # Save the updated state file even if the bot step failed,
-      # so cooldowns / recap date / seen headlines are never lost.
+      # Save both state files even if the bot step failed so cooldowns,
+      # recap date, seen headlines, and signal memory are never lost.
       - name: Save state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: seen_headlines.json
+          path: |
+            seen_headlines.json
+            signal_memory.json
           key: seen-${{ github.run_number }}
